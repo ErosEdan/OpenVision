@@ -18,7 +18,7 @@
 
 ## Demo
 
-![Demo](vision-coca-cola.gif)
+![Demo](docs/images/vision-coca-cola.gif)
 
 ---
 
