@@ -16,6 +16,12 @@
 
 ---
 
+## Demo
+
+<video src="vision-coca-cola.mp4" width="100%" controls autoplay muted></video>
+
+---
+
 ## What Can You Do?
 
 > "Ok Vision, what am I looking at?"
