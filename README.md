@@ -18,7 +18,7 @@
 
 ## Demo
 
-<video src="vision-coca-cola.mp4" width="100%" controls autoplay muted></video>
+https://github.com/rayl15/OpenVision/raw/main/vision-coca-cola.mp4
 
 ---
 
