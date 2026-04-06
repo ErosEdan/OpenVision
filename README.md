@@ -16,6 +16,12 @@
 
 ---
 
+## Demo
+
+https://github.com/rayl15/OpenVision/raw/main/vision-coca-cola.mp4
+
+---
+
 ## What Can You Do?
 
 > "Ok Vision, what am I looking at?"
