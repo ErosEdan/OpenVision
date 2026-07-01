@@ -28,6 +28,9 @@ struct VoiceAgentView: View {
     @State private var aiTranscript = ""
     @State private var currentToolName: String?
     @State private var errorMessage: String?
+    // De-dup: the last command we processed and when (drops duplicate recognizer emissions).
+    @State private var lastProcessedCommand = ""
+    @State private var lastProcessedAt = Date.distantPast
     @State private var audioLevel: CGFloat = 0
     @State private var hasRequestedSpeechAuth = false
 
@@ -119,6 +122,13 @@ struct VoiceAgentView: View {
         .onAppear {
             setupVoiceCommandService()
             setupGlassesCallbacks()
+            preloadLocalModelIfNeeded()
+            // Resume wake-word listening when returning to this screen. .onDisappear stops it
+            // (e.g. when navigating to Settings), and the one-time .task doesn't re-run on return —
+            // so without this, the wake word stayed dead until you tapped the mic button.
+            if voiceCommandService.authorizationStatus == .authorized && !voiceCommandService.isListening {
+                startWakeWordListening()
+            }
         }
         .onDisappear {
             voiceCommandService.stopListening()
@@ -158,8 +168,12 @@ struct VoiceAgentView: View {
             print("[VoiceAgentView] VoiceCommandService state changed to: \(newState)")
             switch newState {
             case .idle:
-                // Conversation ended, return to idle
-                if isSessionActive {
+                // Conversation ended, return to idle — BUT ignore the transient .idle that fires
+                // while a session is starting up: configureAudioForGlasses() briefly stops the
+                // recognizer (→ .idle) mid-startup, which otherwise tore the session right back
+                // down and left commands "ignored" (stuck on thinking). agentState == .connecting
+                // means we're still starting, so don't treat it as a real conversation end.
+                if isSessionActive && agentState != .connecting {
                     print("[VoiceAgentView] Voice service idle, stopping session")
                     isSessionActive = false
                     agentState = .idle
@@ -170,6 +184,14 @@ struct VoiceAgentView: View {
                             await OpenClawService.shared.disconnect()
                         case .geminiLive:
                             await GeminiLiveService.shared.disconnect()
+                        case .openAI:
+                            break   // stateless HTTP — nothing to disconnect
+                        case .localGemma:
+                            // Keep the on-device model LOADED so the next "Ok Vision" is instant.
+                            // Unloading + reloading the ~3.6GB model per conversation was the cause
+                            // of the "connecting…" lag and hangs. It stays resident until the app
+                            // backgrounds or the user switches backend.
+                            break
                         }
                     }
                 }
@@ -431,6 +453,10 @@ struct VoiceAgentView: View {
                     // User says "start video stream" → startLiveVideoMode()
                     // User says "take a photo" → captureAndSendPhoto() starts streaming on-demand
 
+                case .openAI:
+                    try await OpenAIService.shared.connect()
+                    // Stateless HTTP — photos are captured on-demand like OpenClaw.
+
                 case .geminiLive:
                     try await GeminiLiveService.shared.connect()
                     // Start glasses streaming for Gemini Live mode
@@ -444,6 +470,13 @@ struct VoiceAgentView: View {
                         print("[VoiceAgentView] Starting glasses stream for Gemini Live...")
                         await glassesManager.startStreaming()
                     }
+
+                case .localGemma:
+                    // On-device Gemma: load the model (must be downloaded first).
+                    // Text-only in Phase 1 — no glasses streaming needed.
+                    try await GemmaLocalService.shared.connect(
+                        modelId: settingsManager.settings.localGemmaModelId
+                    )
                 }
 
                 agentState = .listening
@@ -466,6 +499,23 @@ struct VoiceAgentView: View {
                 isSessionActive = false
                 agentState = .idle
             }
+        }
+    }
+
+    /// Bring wake-word listening back after using the glasses camera. On DAT 0.4.0 the camera
+    /// stream uses the Bluetooth transport, which disrupts the mic audio route and kills the
+    /// speech recognizer — so we force a clean restart (reconfigure audio + restart listening).
+    /// This is OpenVision's equivalent of OpenGlasses' "restore audio for wake word" after capture.
+    private func resumeWakeWordListening() {
+        guard settingsManager.settings.wakeWordEnabled,
+              voiceCommandService.authorizationStatus == .authorized else { return }
+        voiceCommandService.stopListening()
+        try? AudioSessionManager.shared.configureForGlasses()
+        do {
+            try voiceCommandService.startListening()
+            print("[VoiceAgentView] ✓ Restored wake-word listening after camera use")
+        } catch {
+            print("[VoiceAgentView] Failed to restore listening after camera: \(error)")
         }
     }
 
@@ -522,6 +572,12 @@ struct VoiceAgentView: View {
                 await OpenClawService.shared.disconnect()
             case .geminiLive:
                 await GeminiLiveService.shared.disconnect()
+            case .openAI:
+                break   // stateless HTTP — nothing to disconnect
+            case .localGemma:
+                // Keep the on-device model loaded — see note in the .idle handler. Reloading it
+                // per conversation was what made "Ok Vision" slow/flaky.
+                break
             }
 
             // Stop glasses streaming (turns off LED)
@@ -567,6 +623,21 @@ struct VoiceAgentView: View {
     // MARK: - Voice Command Setup
 
     /// Request speech recognition authorization
+    /// Warm up the on-device model in the background so the FIRST "Ok Vision" is instant
+    /// (no multi-second load on wake). Only when Local Gemma is the selected, downloaded backend.
+    private func preloadLocalModelIfNeeded() {
+        guard settingsManager.settings.aiBackend == .localGemma,
+              settingsManager.settings.localGemmaModelReady else { return }
+        Task {
+            do {
+                try await GemmaLocalService.shared.connect(modelId: settingsManager.settings.localGemmaModelId)
+                print("[VoiceAgentView] Local model preloaded — wake word will be instant")
+            } catch {
+                print("[VoiceAgentView] Local model preload failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
     private func requestSpeechAuthorization() async {
         guard !hasRequestedSpeechAuth else { return }
         hasRequestedSpeechAuth = true
@@ -646,6 +717,10 @@ struct VoiceAgentView: View {
                     await OpenClawService.shared.interrupt()
                 case .geminiLive:
                     await GeminiLiveService.shared.interrupt()
+                case .openAI:
+                    break   // single request/response — nothing to interrupt
+                case .localGemma:
+                    GemmaLocalService.shared.interrupt()
                 }
             }
         }
@@ -664,6 +739,39 @@ struct VoiceAgentView: View {
 
     /// Setup AI service callbacks for receiving responses
     private func setupAIServiceCallbacks() {
+        // Local Gemma callbacks
+        GemmaLocalService.shared.onPartialResponse = { (partial: String) in
+            guard self.isSessionActive else { return }
+            // Show tokens as they stream so it doesn't look stuck on "thinking".
+            self.aiTranscript = partial
+        }
+        GemmaLocalService.shared.onAgentMessage = { (message: String) in
+            guard self.isSessionActive else { return }
+            self.aiTranscript = message
+            self.speakResponse(message)
+        }
+        GemmaLocalService.shared.onProcessingChanged = { (isProcessing: Bool) in
+            if isProcessing {
+                self.agentState = .thinking
+            } else if self.agentState == .thinking && !self.ttsService.isSpeaking {
+                self.agentState = self.isSessionActive ? .listening : .idle
+            }
+        }
+
+        // OpenAI callbacks
+        OpenAIService.shared.onAgentMessage = { (message: String) in
+            guard self.isSessionActive else { return }
+            self.aiTranscript = message
+            self.speakResponse(message)
+        }
+        OpenAIService.shared.onProcessingChanged = { (isProcessing: Bool) in
+            if isProcessing {
+                self.agentState = .thinking
+            } else if self.agentState == .thinking && !self.ttsService.isSpeaking {
+                self.agentState = self.isSessionActive ? .listening : .idle
+            }
+        }
+
         // OpenClaw callbacks
         OpenClawService.shared.onAgentMessage = { (message: String) in
             print("[VoiceAgentView] Received AI message: \(message.prefix(50))...")
@@ -775,6 +883,10 @@ struct VoiceAgentView: View {
                     await OpenClawService.shared.interrupt()
                 case .geminiLive:
                     await GeminiLiveService.shared.interrupt()
+                case .openAI:
+                    break   // single request/response — nothing to interrupt
+                case .localGemma:
+                    GemmaLocalService.shared.interrupt()
                 }
             }
             // Stay in listening mode
@@ -817,6 +929,28 @@ struct VoiceAgentView: View {
             return
         }
 
+        // Drop only EXACT-duplicate commands fired within a few seconds. The speech
+        // recognizer can emit the same phrase twice (partial + final), which double-fired
+        // photo capture. A *different* follow-up question must still go through, even while
+        // the previous answer is generating/speaking.
+        let now = Date()
+        if command == lastProcessedCommand, now.timeIntervalSince(lastProcessedAt) < 4 {
+            print("[VoiceAgentView] Ignoring duplicate command within 4s: \(command)")
+            return
+        }
+        lastProcessedCommand = command
+        lastProcessedAt = now
+
+        // Face recognition on CLOUD backends: classify via the on-device model (if loaded) up front.
+        // On the Local backend we DON'T do this — routing is merged into the single generation below
+        // (case .localGemma) so we never run two Gemma generations per command (memory/jetsam).
+        if settingsManager.settings.aiBackend != .localGemma {
+            if await handleFaceCommandIfNeeded(command) {
+                agentState = isSessionActive ? .listening : .idle
+                return
+            }
+        }
+
         agentState = .thinking
 
         // Check if this is a vision-related command
@@ -842,9 +976,37 @@ struct VoiceAgentView: View {
                 }
                 // State updates handled by callbacks
 
+            case .openAI:
+                if isPhotoCommand {
+                    print("[VoiceAgentView] Photo command on OpenAI — capturing...")
+                    await captureAndSendPhoto(withPrompt: command)
+                } else {
+                    try await OpenAIService.shared.sendMessage(command)
+                }
+                agentState = isSessionActive ? .listening : .idle
+
             case .geminiLive:
                 try await GeminiLiveService.shared.sendText(command)
                 // Gemini Live handles response streaming via callbacks
+
+            case .localGemma:
+                if isPhotoCommand {
+                    // Local Gemma is text-only for scene description (vision needs a cloud backend).
+                    print("[VoiceAgentView] Photo command on Local Gemma — text-only, guiding to cloud")
+                    agentState = isSessionActive ? .listening : .idle
+                    speakResponse("Local mode is text only. To use the camera to describe things, switch to Gemini or OpenClaw in Settings.")
+                } else {
+                    // ONE generation: the model either routes a face action or answers. Face
+                    // recognition (camera + Apple Vision) still runs on-device.
+                    switch await GemmaLocalService.shared.routeCommand(command) {
+                    case .face(let intent):
+                        await handleFaceIntent(intent)
+                        agentState = isSessionActive ? .listening : .idle
+                    case .answer(let text):
+                        speakResponse(text)
+                        agentState = isSessionActive ? .listening : .idle
+                    }
+                }
             }
         } catch {
             errorMessage = "Failed to send command: \(error.localizedDescription)"
@@ -1045,6 +1207,106 @@ struct VoiceAgentView: View {
     }
 
     /// Capture photo and send to OpenClaw with the user's prompt
+    /// Turn a spoken photo command into a clean vision question for a model that already has
+    /// the image attached. Removes "take a picture / photo" trigger wording so the model
+    /// describes the image instead of protesting that it can't take photos.
+    private func visionPromptFromCommand(_ command: String) -> String {
+        var s = command.lowercased()
+        let triggers = [
+            "take a picture of this", "take a photo of this", "take a picture", "take a photo",
+            "take photo", "take picture", "capture a photo", "capture photo", "snap a photo",
+            "snap a picture", "can you", "could you", "would you", "please", "for me", "of this",
+            "right now", "go ahead and"
+        ]
+        for t in triggers { s = s.replacingOccurrences(of: t, with: " ") }
+        s = s.replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        while s.hasPrefix("and ") { s = String(s.dropFirst(4)) }
+        s = s.trimmingCharacters(in: CharacterSet(charactersIn: " ,.?!"))
+        if s.count < 3 {
+            return "What is the main object in this image? Name it specifically and describe its key visible details in 2–3 sentences."
+        }
+        return "Look closely at the image and answer specifically and concretely: \(s)"
+    }
+
+    // MARK: - Face recognition
+
+    /// Route face-recognition commands using the on-device model as an intent classifier
+    /// (agentic — no keyword matching, like OpenGlasses' face_recognition tool). Returns true
+    /// if the command was a face command and was handled.
+    private func handleFaceCommandIfNeeded(_ command: String) async -> Bool {
+        guard let intent = await GemmaLocalService.shared.classifyFaceIntent(command) else {
+            return false   // model not loaded, or not a face command
+        }
+        await handleFaceIntent(intent)
+        return true
+    }
+
+    /// Carry out a face action (camera capture + Apple Vision), shared by the cloud-backend
+    /// classifier path and the Local-backend single-pass router.
+    private func handleFaceIntent(_ intent: GemmaLocalService.FaceIntent) async {
+        let face = FaceRecognitionService.shared
+        switch intent.action {
+        case "identify":
+            agentState = .thinking
+            guard let image = await currentGlassesImage() else {
+                speakResponse("I couldn't get a picture from the glasses. Make sure they're connected.")
+                return
+            }
+            speakResponse(await face.identify(in: image))
+        case "remember":
+            agentState = .thinking
+            guard !intent.name.isEmpty else {
+                speakResponse("Sure — what's their name?")
+                return
+            }
+            guard let image = await currentGlassesImage() else {
+                speakResponse("I couldn't get a picture from the glasses. Make sure they're connected.")
+                return
+            }
+            speakResponse(await face.rememberFace(name: intent.name, from: image))
+        case "forget":
+            speakResponse(face.forgetFace(name: intent.name))
+        case "list":
+            speakResponse(face.listKnownFaces())
+        default:
+            break
+        }
+    }
+
+    /// Get a fresh UIImage frame from the glasses camera, then turn the camera off
+    /// ("click and go") — unless we're in live video mode.
+    private func currentGlassesImage() async -> UIImage? {
+        guard glassesManager.isRegistered else { return nil }
+        if !glassesManager.isStreaming { await glassesManager.startStreaming() }
+        var frame: UIImage?
+        for _ in 0..<40 {   // up to ~4s for a fresh frame
+            if let f = glassesManager.lastFrame { frame = f; break }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if frame == nil { frame = glassesManager.lastFrame }
+        if glassesManager.isStreaming && !isLiveVideoMode {
+            await glassesManager.stopStreaming()
+        }
+        // The glasses camera (0.4.0, Bluetooth) disrupts the mic route — restore listening.
+        resumeWakeWordListening()
+        return frame
+    }
+
+    /// Send a prompt (optionally with a photo) to whichever backend is currently selected.
+    private func sendPromptToActiveBackend(_ prompt: String, imageData: Data?) async throws {
+        switch settingsManager.settings.aiBackend {
+        case .openClaw:
+            try await OpenClawService.shared.sendMessage(prompt, imageData: imageData)
+        case .openAI:
+            try await OpenAIService.shared.sendMessage(prompt, imageData: imageData)
+        case .localGemma:
+            try await GemmaLocalService.shared.sendMessage(prompt, imageData: imageData)
+        case .geminiLive:
+            // Gemini Live streams video continuously; just send the text prompt.
+            try await GeminiLiveService.shared.sendText(prompt)
+        }
+    }
+
     private func captureAndSendPhoto(withPrompt prompt: String) async {
         // Try to get an image from various sources
         var imageData: Data?
@@ -1071,42 +1333,39 @@ struct VoiceAgentView: View {
             }
         }
 
-        if glassesManager.isStreaming {
-            // Capture from glasses camera
-            print("[VoiceAgentView] Capturing from glasses...")
-            imageData = await capturePhotoFromGlasses()
-        } else {
-            print("[VoiceAgentView] Stream not active, checking for last frame...")
-        }
+        // Capture straight from the live video stream. The glasses' one-shot photo API
+        // (session.capturePhoto) doesn't reliably deliver on this model/SDK — it times out
+        // after 5s — whereas a live frame is available immediately. freshLiveFrame() ensures
+        // the stream is running, waits for a fresh frame, and restarts a stalled stream.
+        imageData = await freshLiveFrame()
 
-        // Fallback to last frame if we have one
-        if imageData == nil, let lastFrame = glassesManager.lastFrame {
-            print("[VoiceAgentView] Using last frame...")
-            imageData = lastFrame.jpegData(compressionQuality: 0.8)
+        NSLog("[OV] captureAndSendPhoto result: %@ (streaming=%@, registered=%@)",
+              imageData == nil ? "NO IMAGE" : "\(imageData!.count) bytes",
+              glassesManager.isStreaming ? "yes" : "no",
+              glassesManager.isRegistered ? "yes" : "no")
+
+        // "Click and go": now that we have the photo, turn the glasses camera off immediately —
+        // before the (multi-second) model inference — so the LED doesn't stay on. Repeat photo
+        // commands restart the camera reliably via freshLiveFrame(). Skip in live video mode.
+        if imageData != nil && glassesManager.isStreaming && !isLiveVideoMode {
+            NSLog("[OV] photo captured — stopping camera (click and go)")
+            await glassesManager.stopStreaming()
         }
 
         // Send with or without image
         do {
             if let imageData = imageData {
-                print("[VoiceAgentView] Sending message with photo (\(imageData.count) bytes)")
-                try await OpenClawService.shared.sendMessage(prompt, imageData: imageData)
-
-                // Only stop streaming if:
-                // 1. We started it just for this photo, AND
-                // 2. Not in live video mode
-                if startedStreamingForPhoto && !isLiveVideoMode {
-                    print("[VoiceAgentView] Stopping camera stream after photo")
-                    await glassesManager.stopStreaming()
-                } else if isLiveVideoMode {
-                    print("[VoiceAgentView] Keeping stream active for live video mode")
-                }
+                // The image is attached, so strip the "take a picture" wording — otherwise the
+                // VLM replies "I can't take photos / please provide an image" before describing.
+                let visionPrompt = visionPromptFromCommand(prompt)
+                NSLog("[OV] Sending message with photo (%d bytes), prompt: \"%@\"", imageData.count, visionPrompt)
+                try await sendPromptToActiveBackend(visionPrompt, imageData: imageData)
             } else {
-                print("[VoiceAgentView] No image available, sending text only")
-                // Provide more helpful message
-                let note = glassesManager.isRegistered
-                    ? " (Note: Camera is not available right now. Try starting the camera from Settings > Glasses first.)"
-                    : " (Note: Smart glasses not connected. Please register in Settings.)"
-                try await OpenClawService.shared.sendMessage(prompt + note)
+                NSLog("[OV] No image available — capture returned nil; NOT sending to model")
+                // Don't send a degraded text-only prompt to the model — that's what makes it
+                // reply "please provide an image". Tell the user directly and stop.
+                errorMessage = "Couldn't capture a photo (streaming: \(glassesManager.isStreaming ? "on" : "off"), registered: \(glassesManager.isRegistered ? "yes" : "no")). Try again."
+                speakResponse("I couldn't get a photo from the glasses. Please try again.")
             }
         } catch {
             print("[VoiceAgentView] Failed to send: \(error)")
@@ -1122,22 +1381,55 @@ struct VoiceAgentView: View {
 
     /// Capture photo from glasses and return the data
     private func capturePhotoFromGlasses() async -> Data? {
-        // Simple approach: just wait for photo via lastPhotoData
-        // Request the capture
+        // Clear any stale photo before requesting a fresh capture.
+        glassesManager.lastPhotoData = nil
+        NSLog("[OV] capturePhotoFromGlasses: requesting capture (streaming=%@)", glassesManager.isStreaming ? "yes" : "no")
         await glassesManager.capturePhoto()
 
         // Wait for photo data to appear (poll for up to 5 seconds)
         for _ in 0..<50 {
             if let photoData = glassesManager.lastPhotoData {
-                // Clear it so we don't reuse it
                 glassesManager.lastPhotoData = nil
-                print("[VoiceAgentView] Photo captured: \(photoData.count) bytes")
+                NSLog("[OV] Photo captured: %d bytes", photoData.count)
                 return photoData
             }
             try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
         }
 
-        print("[VoiceAgentView] Photo capture timed out")
+        NSLog("[OV] Photo capture TIMED OUT after 5s")
+        return nil
+    }
+
+    /// Force a fresh live video frame, restarting the stream if it has stalled.
+    /// More reliable than the one-shot photo capture for repeated requests in a session.
+    private func freshLiveFrame() async -> Data? {
+        guard glassesManager.isRegistered else { return nil }
+        if !glassesManager.isStreaming {
+            await glassesManager.startStreaming()
+        }
+        // Wait for a NEW frame (clear first so we don't reuse a stale one).
+        glassesManager.lastFrame = nil
+        for _ in 0..<25 { // up to ~2.5s
+            if let f = glassesManager.lastFrame {
+                NSLog("[OV] fresh live frame acquired")
+                return f.jpegData(compressionQuality: 0.8)
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        // Stream appears stalled — restart it once and retry.
+        NSLog("[OV] live frame stalled — restarting stream")
+        await glassesManager.stopStreaming()
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        await glassesManager.startStreaming()
+        glassesManager.lastFrame = nil
+        for _ in 0..<30 { // up to ~3s
+            if let f = glassesManager.lastFrame {
+                NSLog("[OV] fresh live frame acquired after restart")
+                return f.jpegData(compressionQuality: 0.8)
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        NSLog("[OV] freshLiveFrame: STILL no frame after restart")
         return nil
     }
 

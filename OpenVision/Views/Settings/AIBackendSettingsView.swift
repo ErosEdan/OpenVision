@@ -67,6 +67,26 @@ struct AIBackendSettingsView: View {
                         configurationBadge(configured: settingsManager.settings.isGeminiConfigured)
                     }
                 }
+
+                NavigationLink {
+                    OpenAISettingsView()
+                } label: {
+                    HStack {
+                        Label("OpenAI Settings", systemImage: "sparkles")
+                        Spacer()
+                        configurationBadge(configured: settingsManager.settings.isOpenAIConfigured)
+                    }
+                }
+
+                NavigationLink {
+                    GemmaSettingsView()
+                } label: {
+                    HStack {
+                        Label("Local Gemma", systemImage: "cpu")
+                        Spacer()
+                        configurationBadge(configured: settingsManager.settings.isLocalGemmaConfigured)
+                    }
+                }
             } header: {
                 Text("Configuration")
             }

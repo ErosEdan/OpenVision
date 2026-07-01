@@ -146,16 +146,35 @@ final class VoiceCommandService: ObservableObject {
             throw VoiceCommandError.requestCreationFailed
         }
 
-        recognitionRequest.shouldReportPartialResults = true
-        recognitionRequest.taskHint = .dictation
+        configureRecognitionRequest(recognitionRequest)
 
         // Get input node
         let inputNode = audioEngine.inputNode
+        inputNode.removeTap(onBus: 0) // defensive: never install over an existing tap
         let recordingFormat = inputNode.outputFormat(forBus: 0)
 
-        // Install tap
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
-            recognitionRequest.append(buffer)
+        // Guard against an invalid input format. This happens when the mic is unavailable —
+        // most commonly while the user is on a phone/FaceTime call, where the input route
+        // reports 0 Hz / 0 channels. Installing a tap with that format throws (SIGABRT),
+        // so bail gracefully instead of crashing.
+        guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
+            print("[VoiceCommand] Input unavailable (format \(recordingFormat.sampleRate)Hz/\(recordingFormat.channelCount)ch) — mic likely in use by a call. Skipping listen.")
+            self.recognitionRequest = nil
+            self.audioEngine = nil
+            throw VoiceCommandError.audioEngineUnavailable
+        }
+
+        // Install tap — wrapped so an AVAudioEngine NSException (mic busy / bad route, e.g.
+        // during a phone call) fails gracefully instead of aborting the process.
+        if let reason = OVCatchException({
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
+                recognitionRequest.append(buffer)
+            }
+        }) {
+            print("[VoiceCommand] installTap failed: \(reason)")
+            self.recognitionRequest = nil
+            self.audioEngine = nil
+            throw VoiceCommandError.audioEngineUnavailable
         }
 
         // Start audio engine first (before recognition task)
@@ -175,12 +194,35 @@ final class VoiceCommandService: ObservableObject {
         recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             Task { @MainActor in
                 self?.handleRecognitionResult(result: result, error: error)
+                self?.restartIfRecognizerEnded(result: result, error: error)
             }
         }
 
         isListening = true
         state = isWakeWordEnabled ? .idle : .listening
         print("[VoiceCommand] Started listening - audio engine running")
+    }
+
+    /// Prime the recognizer for the wake phrase and short-phrase detection. `contextualStrings`
+    /// biases recognition toward "Ok Vision", which is the single biggest factor in reliably
+    /// hearing the wake word over the low-quality glasses Bluetooth-HFP mic (8 kHz). `.search`
+    /// (short phrase) beats `.dictation` (long-form) for a quick wake word + command.
+    private func configureRecognitionRequest(_ request: SFSpeechAudioBufferRecognitionRequest) {
+        request.shouldReportPartialResults = true
+        request.taskHint = .search
+        var phrases = ["Ok Vision", "Okay Vision", "Hey Vision", "Vision"]
+        if !wakeWord.isEmpty { phrases.insert(wakeWord, at: 0) }
+        request.contextualStrings = phrases
+    }
+
+    /// SFSpeechRecognizer stops after ~1 minute or when it emits a final result / errors. While
+    /// idling for the wake word that would silently kill listening ("responds once in a while"),
+    /// so restart a fresh recognizer whenever the task ends and we're still meant to be listening.
+    private func restartIfRecognizerEnded(result: SFSpeechRecognitionResult?, error: Error?) {
+        let ended = (error != nil) || (result?.isFinal ?? false)
+        guard ended, isListening, isWakeWordEnabled, state == .idle else { return }
+        print("[VoiceCommand] Recognizer ended while idle — restarting wake-word listener")
+        restartRecognition()
     }
 
     /// Stop listening
@@ -241,22 +283,37 @@ final class VoiceCommandService: ObservableObject {
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
         guard let recognitionRequest = recognitionRequest else { return }
 
-        recognitionRequest.shouldReportPartialResults = true
-        recognitionRequest.taskHint = .dictation
+        configureRecognitionRequest(recognitionRequest)
 
         // Reinstall tap
         guard let audioEngine = audioEngine else { return }
         let inputNode = audioEngine.inputNode
+        inputNode.removeTap(onBus: 0) // defensive: never install over an existing tap
         let recordingFormat = inputNode.outputFormat(forBus: 0)
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
-            recognitionRequest.append(buffer)
+        // Skip if the mic is unavailable (e.g. on a call) — installing a tap with a
+        // 0 Hz / 0 channel format throws.
+        guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
+            print("[VoiceCommand] Input unavailable on reinstall — skipping tap")
+            self.recognitionRequest = nil
+            return
+        }
+
+        if let reason = OVCatchException({
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
+                recognitionRequest.append(buffer)
+            }
+        }) {
+            print("[VoiceCommand] installTap (reinstall) failed: \(reason)")
+            self.recognitionRequest = nil
+            return
         }
 
         // Start new recognition task
         recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             Task { @MainActor in
                 self?.handleRecognitionResult(result: result, error: error)
+                self?.restartIfRecognizerEnded(result: result, error: error)
             }
         }
 
