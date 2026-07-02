@@ -31,6 +31,7 @@
 		587295A93FA82DEBB18139BB /* GlassCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01CC70E5327BD07B920833FC /* GlassCard.swift */; };
 		5C474A09B3067A8ACD7546C1 /* AudioCaptureService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2B78D6C28BEFF1F8426997C /* AudioCaptureService.swift */; };
 		62B472287A9628E0E6FB377D /* GemmaLocalService.swift in Sources */ = {isa = PBXBuildFile; fileRef = DFBB8B07B4970CA5F63B3B2A /* GemmaLocalService.swift */; };
+		67FDB8417ED64F0FF8B576F5 /* KokoroSwift in Frameworks */ = {isa = PBXBuildFile; productRef = 1DCD8AD4861E50005E48943D /* KokoroSwift */; };
 		6878487E101CAC3A8BF651E9 /* AnimatedBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41F6DCD4CB868C1A5711F96D /* AnimatedBackground.swift */; };
 		6C065C29CC13488E67A70363 /* SoundService.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE2B8AE1E195B62D980BEA66 /* SoundService.swift */; };
 		6E678BA570E5148EE9D9B4FE /* HuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = CCBF8A11015C4FD6F78FF103 /* HuggingFace */; };
@@ -43,6 +44,7 @@
 		7C118644498027D47E828115 /* wake_word_ding.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = 98C627C6F13B708A7A8D2CDA /* wake_word_ding.mp3 */; };
 		800BD44B75446351A267E190 /* OpenAISettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5D83F733F1799E2675A34CC4 /* OpenAISettingsView.swift */; };
 		81F38E617E61131E8C87620B /* MWDATCore in Frameworks */ = {isa = PBXBuildFile; productRef = A7FF778329794C28B434EEAA /* MWDATCore */; };
+		8351C940EEB51503B73F3449 /* KokoroSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F363A639A7050AFBDFAF486 /* KokoroSettingsView.swift */; };
 		8BB3557D9BE4E9F2399BDBC1 /* VoiceAgentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 601D21AA8114E457F40C6C4A /* VoiceAgentView.swift */; };
 		A7A3B0467B07F116AEF20BEE /* AudioSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3DA55F18F98C8B110680989C /* AudioSessionManager.swift */; };
 		AF2C901CA288086B7EBA6083 /* Constants.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7376B3EE1F53DF1BD56B1095 /* Constants.swift */; };
@@ -62,6 +64,7 @@
 		EF5319DFC76B8BD9A50EF195 /* OpenVisionApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3FFDFCB5AA5A664CC70E183 /* OpenVisionApp.swift */; };
 		F1D86E9A3AB2A994A205AB83 /* GeminiSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 773753CA73EBA9F8C78BD8E4 /* GeminiSettingsView.swift */; };
 		F7718545E4E6BB4A7773B564 /* SettingsManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADC230E2AE44E5132DC5AB01 /* SettingsManager.swift */; };
+		FCA8B46A222A0C469FF7873B /* KokoroTTSService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE848862D72446F7BBDD3D89 /* KokoroTTSService.swift */; };
 		FCFECBF332943E64812DC931 /* AIBackendSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57A8327E5265287A0C89DE3D /* AIBackendSettingsView.swift */; };
 		FFFDF7E8B3F8E6A194E1571E /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 8F8A2A9D74F79603F186C7B4 /* Tokenizers */; };
 /* End PBXBuildFile section */
@@ -80,6 +83,7 @@
 		41F6DCD4CB868C1A5711F96D /* AnimatedBackground.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnimatedBackground.swift; sourceTree = "<group>"; };
 		44D24962AB43639AF3B59662 /* WebSearchService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebSearchService.swift; sourceTree = "<group>"; };
 		484468B5604EFF4051074762 /* MemoriesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MemoriesView.swift; sourceTree = "<group>"; };
+		4F363A639A7050AFBDFAF486 /* KokoroSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KokoroSettingsView.swift; sourceTree = "<group>"; };
 		516A0726470BFA8BD9B55F3F /* AdditionalInstructionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdditionalInstructionsView.swift; sourceTree = "<group>"; };
 		529F4C0838CFE7F8F55E28E4 /* AudioPlaybackService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioPlaybackService.swift; sourceTree = "<group>"; };
 		57A8327E5265287A0C89DE3D /* AIBackendSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIBackendSettingsView.swift; sourceTree = "<group>"; };
@@ -103,6 +107,7 @@
 		ADCFF581A7AE50FBF35EA257 /* GeminiLiveService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeminiLiveService.swift; sourceTree = "<group>"; };
 		B2B78D6C28BEFF1F8426997C /* AudioCaptureService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioCaptureService.swift; sourceTree = "<group>"; };
 		B2FD4A9B156D92B468B28864 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
+		BE848862D72446F7BBDD3D89 /* KokoroTTSService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KokoroTTSService.swift; sourceTree = "<group>"; };
 		C1BF0DC63344C51A046E37E0 /* OVExceptionCatcher.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = OVExceptionCatcher.h; sourceTree = "<group>"; };
 		C1BFC8380B5BDA0778E04EAB /* GemmaSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GemmaSettingsView.swift; sourceTree = "<group>"; };
 		C27052ECD2FFC79652B5CDB3 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
@@ -115,6 +120,7 @@
 		CE2B8AE1E195B62D980BEA66 /* SoundService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SoundService.swift; sourceTree = "<group>"; };
 		CEE6F61B22736F87248FD0F5 /* LocalAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalAgent.swift; sourceTree = "<group>"; };
 		D1428DBC281E476E9331F9B4 /* OpenVision-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "OpenVision-Bridging-Header.h"; sourceTree = "<group>"; };
+		D2563E08B4723C4A8848A8A6 /* kokoro-ios */ = {isa = PBXFileReference; lastKnownFileType = folder; name = "kokoro-ios"; path = "Vendor/kokoro-ios"; sourceTree = SOURCE_ROOT; };
 		D416290774C17FDC0DDFBC68 /* TTSService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TTSService.swift; sourceTree = "<group>"; };
 		DFBB8B07B4970CA5F63B3B2A /* GemmaLocalService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GemmaLocalService.swift; sourceTree = "<group>"; };
 		E553EFA930E3B93EEA8F0AB6 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
@@ -137,6 +143,7 @@
 				B82C3BB7AED7C2367F729678 /* MLXHuggingFace in Frameworks */,
 				6E678BA570E5148EE9D9B4FE /* HuggingFace in Frameworks */,
 				FFFDF7E8B3F8E6A194E1571E /* Tokenizers in Frameworks */,
+				67FDB8417ED64F0FF8B576F5 /* KokoroSwift in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -152,6 +159,7 @@
 				773753CA73EBA9F8C78BD8E4 /* GeminiSettingsView.swift */,
 				C1BFC8380B5BDA0778E04EAB /* GemmaSettingsView.swift */,
 				ED25EC5E800C216965A50F8A /* GlassesSettingsView.swift */,
+				4F363A639A7050AFBDFAF486 /* KokoroSettingsView.swift */,
 				484468B5604EFF4051074762 /* MemoriesView.swift */,
 				5D83F733F1799E2675A34CC4 /* OpenAISettingsView.swift */,
 				EAFCA981F220C3F978645D70 /* OpenClawSettingsView.swift */,
@@ -320,6 +328,14 @@
 			path = OpenClaw;
 			sourceTree = "<group>";
 		};
+		8F12C1169529CE44B11137F4 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				D2563E08B4723C4A8848A8A6 /* kokoro-ios */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
 		95CA46C43A53365AD4139930 /* AppleFoundation */ = {
 			isa = PBXGroup;
 			children = (
@@ -369,6 +385,7 @@
 		C6EBF5734AD805262779ECA5 /* TTS */ = {
 			isa = PBXGroup;
 			children = (
+				BE848862D72446F7BBDD3D89 /* KokoroTTSService.swift */,
 				D416290774C17FDC0DDFBC68 /* TTSService.swift */,
 			);
 			path = TTS;
@@ -398,6 +415,7 @@
 			children = (
 				09EB633ED6C10098514FA100 /* OpenVision */,
 				792E8D9249D5790897D4615F /* OpenVision */,
+				8F12C1169529CE44B11137F4 /* Packages */,
 				36F672D5AB5BCE7D4C73AA30 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -455,6 +473,7 @@
 				4169E6A87853A9ECECC3C6E4 /* MLXHuggingFace */,
 				CCBF8A11015C4FD6F78FF103 /* HuggingFace */,
 				8F8A2A9D74F79603F186C7B4 /* Tokenizers */,
+				1DCD8AD4861E50005E48943D /* KokoroSwift */,
 			);
 			productName = OpenVision;
 			productReference = 8601201988376029090B1EAA /* OpenVision.app */;
@@ -490,6 +509,7 @@
 				ECA8A07B405261A27FD7625B /* XCRemoteSwiftPackageReference "mlx-swift-lm" */,
 				15C5A08D3F97FF9BA942B321 /* XCRemoteSwiftPackageReference "swift-huggingface" */,
 				922ADEF49EB5DA6AD8635D76 /* XCRemoteSwiftPackageReference "swift-transformers" */,
+				A8456994C4E280FE9D1FCB59 /* XCLocalSwiftPackageReference "Vendor/kokoro-ios" */,
 			);
 			preferredProjectObjectVersion = 77;
 			projectDirPath = "";
@@ -566,6 +586,8 @@
 				BE99A2B1118292BBC7E1FC59 /* GlassesManager.swift in Sources */,
 				E93E2788532682366707A34D /* GlassesSettingsView.swift in Sources */,
 				29F56C03229677BC1F157CEC /* HapticFeedback.swift in Sources */,
+				8351C940EEB51503B73F3449 /* KokoroSettingsView.swift in Sources */,
+				FCA8B46A222A0C469FF7873B /* KokoroTTSService.swift in Sources */,
 				53C17BBA774E7D3D4E295584 /* LocalAgent.swift in Sources */,
 				CDA89E5AAAF25713C6321971 /* MainTabView.swift in Sources */,
 				341497F0AA31AE9C6E137386 /* MemoriesView.swift in Sources */,
@@ -795,6 +817,13 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		A8456994C4E280FE9D1FCB59 /* XCLocalSwiftPackageReference "Vendor/kokoro-ios" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = "Vendor/kokoro-ios";
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCRemoteSwiftPackageReference section */
 		15C5A08D3F97FF9BA942B321 /* XCRemoteSwiftPackageReference "swift-huggingface" */ = {
 			isa = XCRemoteSwiftPackageReference;
@@ -835,6 +864,10 @@
 			isa = XCSwiftPackageProductDependency;
 			package = F7EEA1ED9999A23C56A77DE0 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
 			productName = MWDATCamera;
+		};
+		1DCD8AD4861E50005E48943D /* KokoroSwift */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = KokoroSwift;
 		};
 		4169E6A87853A9ECECC3C6E4 /* MLXHuggingFace */ = {
 			isa = XCSwiftPackageProductDependency;
