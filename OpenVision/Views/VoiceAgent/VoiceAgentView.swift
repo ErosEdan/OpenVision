@@ -193,6 +193,15 @@ struct VoiceAgentView: View {
             print("[VoiceAgentView] VoiceCommandService state changed to: \(newState)")
             switch newState {
             case .idle:
+                // In live video mode, a silence timeout must NOT end the mode — the user expects
+                // to keep asking questions (camera stays on) until they say "stop video". Re-arm
+                // conversation mode so the next question is heard without a fresh wake word.
+                if isLiveVideoMode {
+                    print("[VoiceAgentView] Idle during live video — re-arming conversation mode")
+                    voiceCommandService.enterConversationMode()
+                    agentState = .liveVideo
+                    return
+                }
                 // A real conversation end is the recognizer going idle *while we were listening*
                 // for the user (silence timeout). An .idle in any other state (.connecting startup,
                 // .thinking/.toolRunning command processing, .speaking a reply) is a transient from
@@ -225,11 +234,17 @@ struct VoiceAgentView: View {
                     }
                 }
             case .listening:
-                if isSessionActive {
+                // Keep the live indicator up in live video mode (don't clobber it back to
+                // plain .listening, which would let the next idle tear the session down).
+                if isLiveVideoMode {
+                    agentState = .liveVideo
+                } else if isSessionActive {
                     agentState = .listening
                 }
             case .conversationMode:
-                if isSessionActive {
+                if isLiveVideoMode {
+                    agentState = .liveVideo
+                } else if isSessionActive {
                     agentState = .listening
                 }
             case .processing:
@@ -753,6 +768,12 @@ struct VoiceAgentView: View {
 
         // Conversation timeout (user didn't speak after AI response)
         voiceCommandService.onConversationTimeout = {
+            // In live video mode, silence must not end the session — the .idle state handler
+            // re-arms conversation mode so the user can keep asking until they say "stop video".
+            if self.isLiveVideoMode {
+                print("[VoiceAgentView] Conversation timeout during live video — staying live")
+                return
+            }
             print("[VoiceAgentView] Conversation timeout - returning to idle")
             self.stopSession()
         }
@@ -767,12 +788,14 @@ struct VoiceAgentView: View {
     private func setupAIServiceCallbacks() {
         // Local Gemma callbacks
         GemmaLocalService.shared.onPartialResponse = { (partial: String) in
-            guard self.isSessionActive else { return }
+            guard self.isSessionActive || self.isLiveVideoMode else { return }
             // Show tokens as they stream so it doesn't look stuck on "thinking".
             self.aiTranscript = partial
         }
         GemmaLocalService.shared.onAgentMessage = { (message: String) in
-            guard self.isSessionActive else { return }
+            // In local live video mode replies must flow even if the session timer lapsed
+            // while the user was silently looking around.
+            guard self.isSessionActive || self.isLiveVideoMode else { return }
             self.aiTranscript = message
             self.speakResponse(message)
         }
@@ -780,7 +803,9 @@ struct VoiceAgentView: View {
             if isProcessing {
                 self.agentState = .thinking
             } else if self.agentState == .thinking && !self.ttsService.isSpeaking {
-                self.agentState = self.isSessionActive ? .listening : .idle
+                // Return to the live video indicator, not plain listening, while in live mode.
+                self.agentState = self.isLiveVideoMode ? .liveVideo
+                    : (self.isSessionActive ? .listening : .idle)
             }
         }
 
@@ -941,11 +966,14 @@ struct VoiceAgentView: View {
         // Check for live video mode commands
         let startLiveKeywords = ["start video stream", "start live video", "start video", "start streaming",
                                  "enable video", "live mode", "go live", "video mode"]
-        let stopLiveKeywords = ["stop video stream", "stop live video", "stop video", "stop streaming",
-                               "disable video", "end live mode", "exit video mode", "stop live"]
 
         let isStartLiveCommand = startLiveKeywords.contains { lowerCommand.contains($0) }
-        let isStopLiveCommand = stopLiveKeywords.contains { lowerCommand.contains($0) }
+        // Fuzzy stop match: any "video"/"stream" phrase with a stop-like word. Tolerates Apple STT
+        // dropping the leading 's' ("stop video" → "top video"), which previously sailed past the
+        // exact-keyword list and got sent to the model as a question instead of ending the mode.
+        let mentionsVideo = lowerCommand.contains("video") || lowerCommand.contains("stream")
+        let stopWords = ["stop", "top ", "end ", "exit", "disable", "close", "quit", "turn off"]
+        let isStopLiveCommand = mentionsVideo && stopWords.contains { lowerCommand.contains($0) }
 
         // Handle live video mode commands
         if isStartLiveCommand {
@@ -960,11 +988,15 @@ struct VoiceAgentView: View {
             return
         }
 
-        // If in live video mode, the live backend handles audio directly - don't process here
+        // If in live video mode, route by which live backend is driving it.
         if isLiveVideoMode {
-            // Audio is streamed to the backend directly, so this shouldn't be reached.
-            // Gemini can accept a text turn as a fallback; OpenAI Realtime uses audio only here.
-            if activeLiveService === geminiLive {
+            if activeLiveService == nil {
+                // Local (SmolVLM2) live mode: STT is the input path, so every command lands here.
+                // Answer it against the latest glasses frame.
+                await handleLocalLiveVideoCommand(command)
+            } else if activeLiveService === geminiLive {
+                // Cloud modes stream audio directly, so this shouldn't be reached — but Gemini
+                // can accept a text turn as a fallback. OpenAI Realtime is audio-only here.
                 do {
                     try await geminiLive.sendText(command)
                 } catch {
@@ -1057,6 +1089,14 @@ struct VoiceAgentView: View {
 
         guard glassesManager.isRegistered else {
             ttsService.speak("Please connect your glasses first")
+            return
+        }
+
+        // Fully on-device live video: with SmolVLM2 loaded as the local backend, keep the glasses
+        // camera streaming and answer each spoken question against the latest frame. No cloud,
+        // no WebSocket — Apple STT keeps listening and the reply is spoken via the selected TTS.
+        if settingsManager.settings.aiBackend == .localGemma && GemmaLocalService.shared.visionReady {
+            await startLocalLiveVideoMode()
             return
         }
 
@@ -1165,6 +1205,63 @@ struct VoiceAgentView: View {
         return nil
     }
 
+    /// Fully on-device live video (SmolVLM2). Unlike the cloud modes, audio stays on the normal
+    /// Apple STT path — we just keep the glasses camera streaming and mark the mode active, so
+    /// each spoken question is answered against the latest frame (see processCommand). Replies
+    /// speak through the selected TTS engine as usual.
+    private func startLocalLiveVideoMode() async {
+        print("[VoiceAgentView] Starting local live video mode (SmolVLM2)...")
+
+        if !glassesManager.isStreaming {
+            await glassesManager.startStreaming()
+        }
+        guard glassesManager.isStreaming else {
+            ttsService.speak("I couldn't start the glasses camera")
+            return
+        }
+
+        // The glasses' Bluetooth HFP mic can't run while their camera streams (it goes deaf —
+        // the PR #15 lesson; photo mode survives because its stream is momentary). Live mode
+        // streams continuously, so force the phone mic + speaker for the whole session and
+        // rebuild recognition on that route. The preferred route is restored on stop.
+        voiceCommandService.stopListening()
+        try? AudioSessionManager.shared.configureForPhone()
+        do {
+            try voiceCommandService.startListening()
+        } catch {
+            print("[VoiceAgentView] Failed to restart STT on phone mic: \(error)")
+        }
+
+        // Stay in conversation mode so follow-ups don't need the wake word.
+        voiceCommandService.enterConversationMode()
+
+        isLiveVideoMode = true
+        agentState = .liveVideo
+
+        print("[VoiceAgentView] ✓ Local live video mode active - SmolVLM2 answering on latest frame")
+        ttsService.speak("Live video mode active, on device")
+    }
+
+    /// Answer a spoken question in local live video mode: latest glasses frame + question → SmolVLM2.
+    private func handleLocalLiveVideoCommand(_ command: String) async {
+        agentState = .thinking
+        guard let frame = glassesManager.lastFrame,
+              let jpeg = frame.jpegData(compressionQuality: 0.6) else {
+            speakResponse("I don't have a camera frame yet — give it a second.")
+            agentState = .liveVideo
+            return
+        }
+        do {
+            // Strip "take a photo"-style wording; the frame is already attached.
+            let prompt = visionPromptFromCommand(command)
+            try await GemmaLocalService.shared.sendMessage(prompt, imageData: jpeg)
+        } catch {
+            print("[VoiceAgentView] Local live video inference failed: \(error)")
+            speakResponse("Sorry, that didn't work. \(error.localizedDescription)")
+        }
+        if isLiveVideoMode { agentState = .liveVideo }
+    }
+
     /// Stop live video mode - return to OpenClaw
     private func stopLiveVideoMode() async {
         guard isLiveVideoMode else {
@@ -1197,6 +1294,11 @@ struct VoiceAgentView: View {
 
         isLiveVideoMode = false
         agentState = isSessionActive ? .listening : .idle
+
+        // Local live mode forced the phone mic (HFP dies during camera streaming) and its STT
+        // may still be running — stop it so the restart below picks up the preferred route.
+        if voiceCommandService.isListening { voiceCommandService.stopListening() }
+        applyPreferredAudioRoute()
 
         // Always restart VoiceCommandService for wake word detection
         do {
@@ -1273,15 +1375,21 @@ struct VoiceAgentView: View {
     /// describes the image instead of protesting that it can't take photos.
     private func visionPromptFromCommand(_ command: String) -> String {
         var s = command.lowercased()
+        // Only strip explicit photo-capture wording — that's what makes a VLM refuse ("I can't
+        // take photos"). Do NOT strip politeness/filler ("would you", "right now", "of this"):
+        // removing those mid-sentence mangled real questions ("what am I looking at right now"
+        // → "what am I looking at"; "would you tell me which plant" → "tell me which plant").
         let triggers = [
             "take a picture of this", "take a photo of this", "take a picture", "take a photo",
             "take photo", "take picture", "capture a photo", "capture photo", "snap a photo",
-            "snap a picture", "can you", "could you", "would you", "please", "for me", "of this",
-            "right now", "go ahead and"
+            "snap a picture", "go ahead and take"
         ]
         for t in triggers { s = s.replacingOccurrences(of: t, with: " ") }
         s = s.replacingOccurrences(of: "  ", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        while s.hasPrefix("and ") { s = String(s.dropFirst(4)) }
+        // Trim leftover connective prefixes left after removing the trigger ("...and tell me…").
+        for prefix in ["and ", "of this ", "of ", "please "] {
+            while s.hasPrefix(prefix) { s = String(s.dropFirst(prefix.count)) }
+        }
         s = s.trimmingCharacters(in: CharacterSet(charactersIn: " ,.?!"))
         if s.count < 3 {
             return "What is the main object in this image? Name it specifically and describe its key visible details in 2–3 sentences."
@@ -1306,9 +1414,15 @@ struct VoiceAgentView: View {
     /// generation that routes a face action, a web search, or a direct spoken answer.
     private func handleLocalCommand(_ command: String, llm: LocalTextLLM, isPhotoCommand: Bool) async {
         if isPhotoCommand {
-            // On-device models are text-only for scene description — vision needs a cloud backend.
+            // SmolVLM2 handles photos fully on-device; other local models are text-only
+            // (Gemma E2B's vision hit the jetsam limit — see GemmaLocalModel.supportsOnDeviceVision).
+            if settingsManager.settings.aiBackend == .localGemma && GemmaLocalService.shared.visionReady {
+                print("[VoiceAgentView] Photo command on local SmolVLM2 — capturing...")
+                await captureAndSendPhoto(withPrompt: command)
+                return
+            }
             agentState = isSessionActive ? .listening : .idle
-            speakResponse("On-device mode is text only. To use the camera to describe things, switch to Gemini or OpenClaw in Settings.")
+            speakResponse("This on-device model is text only. For camera questions, select SmolVLM2 as your local model, or switch to Gemini or OpenClaw in Settings.")
             return
         }
         switch await llm.routeCommand(command) {
@@ -1410,25 +1524,15 @@ struct VoiceAgentView: View {
         var imageData: Data?
         var startedStreamingForPhoto = false
 
-        // Start streaming if glasses are registered but not streaming
+        // Start streaming if glasses are registered but not streaming. `startStreaming()` only
+        // returns after `session.start()` completes (isStreaming is already true here), so the
+        // old "poll up to 3s for isStreaming" loop + fixed 500ms sleep were dead weight that just
+        // kept the LED on longer. freshLiveFrame() below already waits for the first real frame,
+        // so drop the artificial delay entirely.
         if glassesManager.isRegistered && !glassesManager.isStreaming {
             print("[VoiceAgentView] Starting glasses camera stream for photo...")
             await glassesManager.startStreaming()
             startedStreamingForPhoto = true
-
-            // Wait for stream to actually be ready (up to 3 seconds)
-            for _ in 0..<30 {
-                if glassesManager.isStreaming {
-                    print("[VoiceAgentView] Stream is ready!")
-                    break
-                }
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100ms
-            }
-
-            // Give extra time for first frames to arrive
-            if glassesManager.isStreaming {
-                try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
-            }
         }
 
         // Capture straight from the live video stream. The glasses' one-shot photo API
