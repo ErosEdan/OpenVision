@@ -48,6 +48,32 @@ enum Constants {
         static let defaultVideoFPS = 1
     }
 
+    // MARK: - OpenAI Realtime
+
+    enum OpenAIRealtime {
+        /// Path appended to the OpenAI base URL to reach the Realtime WebSocket.
+        /// The base URL's https:// scheme is rewritten to wss:// at connect time.
+        static let websocketPath = "/realtime"
+
+        /// Realtime model id (GA). Override in settings for a pinned snapshot.
+        static let modelName = "gpt-realtime"
+
+        /// Default realtime voice.
+        static let voice = "marin"
+
+        /// Input audio sample rate (Hz). OpenAI Realtime uses 24 kHz PCM16 mono.
+        static let inputSampleRate = 24000
+
+        /// Output audio sample rate (Hz). OpenAI Realtime emits 24 kHz PCM16 mono.
+        static let outputSampleRate = 24000
+
+        /// JPEG quality for video frames sent as image messages (0.0 - 1.0)
+        static let videoJPEGQuality: CGFloat = 0.5
+
+        /// Default video frame rate (fps)
+        static let defaultVideoFPS = 1
+    }
+
     // MARK: - Voice
 
     enum Voice {

@@ -92,6 +92,12 @@ struct AppSettings: Codable, Equatable {
     /// server, Azure-style gateways, etc.). No trailing slash.
     var openAIBaseURL: String = "https://api.openai.com/v1"
 
+    /// Realtime model id used for live audio + video mode (GA gpt-realtime).
+    var openAIRealtimeModel: String = "gpt-realtime"
+
+    /// Voice used by the OpenAI Realtime backend.
+    var openAIRealtimeVoice: String = "marin"
+
     // MARK: - Web Search
 
     /// Tavily API key (free tier). When set, web search uses Tavily (real live content, built for

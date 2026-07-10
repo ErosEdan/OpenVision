@@ -15,6 +15,7 @@ struct VoiceAgentView: View {
     @StateObject private var voiceCommandService = VoiceCommandService.shared
     @StateObject private var geminiVision = GeminiVisionService.shared
     @StateObject private var geminiLive = GeminiLiveService.shared
+    @StateObject private var openAIRealtime = OpenAIRealtimeService.shared
     @StateObject private var ttsService = TTSService.shared
     @StateObject private var kokoroTTS = KokoroTTSService.shared
     @StateObject private var soundService = SoundService.shared
@@ -35,8 +36,12 @@ struct VoiceAgentView: View {
     @State private var audioLevel: CGFloat = 0
     @State private var hasRequestedSpeechAuth = false
 
-    /// Live Video Mode - uses Gemini Live for real-time audio + video
+    /// Live Video Mode - uses Gemini Live or OpenAI Realtime for real-time audio + video
     @State private var isLiveVideoMode = false
+
+    /// The live-video backend currently driving audio/video (Gemini or OpenAI Realtime).
+    /// Set when live video mode starts; used by stop/callbacks so both backends route correctly.
+    @State private var activeLiveService: (any LiveVideoService)?
 
     /// True when voice recognition is ready (audio engine running)
     @State private var isVoiceReady = false
@@ -955,14 +960,16 @@ struct VoiceAgentView: View {
             return
         }
 
-        // If in live video mode, Gemini handles everything - don't process here
+        // If in live video mode, the live backend handles audio directly - don't process here
         if isLiveVideoMode {
-            // Gemini Live is handling audio directly, so this shouldn't be reached
-            // But just in case, we can send text
-            do {
-                try await geminiLive.sendText(command)
-            } catch {
-                print("[VoiceAgentView] Failed to send to Gemini Live: \(error)")
+            // Audio is streamed to the backend directly, so this shouldn't be reached.
+            // Gemini can accept a text turn as a fallback; OpenAI Realtime uses audio only here.
+            if activeLiveService === geminiLive {
+                do {
+                    try await geminiLive.sendText(command)
+                } catch {
+                    print("[VoiceAgentView] Failed to send to Gemini Live: \(error)")
+                }
             }
             return
         }
@@ -1053,30 +1060,39 @@ struct VoiceAgentView: View {
             return
         }
 
-        guard !settingsManager.settings.geminiAPIKey.isEmpty else {
-            ttsService.speak("Please configure your Gemini API key in settings")
+        // Pick the live backend: OpenAI Realtime when OpenAI is the selected + configured backend,
+        // otherwise Gemini Live (the default video provider for every other backend).
+        guard let (service, label) = resolveLiveService() else {
+            ttsService.speak("Please configure your Gemini or OpenAI API key in settings")
             return
         }
+        activeLiveService = service
 
-        print("[VoiceAgentView] Starting live video mode...")
+        print("[VoiceAgentView] Starting live video mode via \(label)...")
 
-        // Stop VoiceCommandService - Gemini will handle audio directly
+        // Stop VoiceCommandService - the live backend will handle audio directly
         voiceCommandService.stopListening()
 
         // Stop TTS if speaking
         ttsService.stop()
         KokoroTTSService.shared.stop()
 
+        // Match the audio pipeline to the backend's sample rates (Gemini 16k in / 24k out,
+        // OpenAI 24k in / 24k out) before starting capture/playback.
+        audioCapture.targetSampleRate = Double(service.inputSampleRate)
+        audioPlayback.inputSampleRate = Double(service.outputSampleRate)
+
         // Start glasses streaming
         if !glassesManager.isStreaming {
             await glassesManager.startStreaming()
         }
 
-        // Connect to Gemini Live
+        // Connect to the live backend
         do {
-            try await geminiLive.connect()
+            try await service.connect()
         } catch {
-            errorMessage = "Failed to connect to Gemini Live: \(error.localizedDescription)"
+            errorMessage = "Failed to connect to \(label): \(error.localizedDescription)"
+            activeLiveService = nil
             // Cleanup: stop streaming and restart voice commands
             if glassesManager.isStreaming {
                 await glassesManager.stopStreaming()
@@ -1090,12 +1106,12 @@ struct VoiceAgentView: View {
             return
         }
 
-        // Setup Gemini Live callbacks
-        setupGeminiLiveCallbacks()
+        // Setup live backend callbacks
+        setupLiveVideoCallbacks(service)
 
-        // Setup audio capture → Gemini Live
-        audioCapture.onAudioCaptured = { [weak geminiLive] data in
-            geminiLive?.sendAudio(data: data)
+        // Setup audio capture → live backend
+        audioCapture.onAudioCaptured = { [weak service] data in
+            service?.sendAudio(data: data)
         }
 
         // Setup audio playback
@@ -1110,25 +1126,43 @@ struct VoiceAgentView: View {
             try audioCapture.startCapture()
         } catch {
             errorMessage = "Failed to start audio capture: \(error.localizedDescription)"
-            await geminiLive.disconnect()
+            await service.disconnect()
+            activeLiveService = nil
             voiceCommandService.enterConversationMode()
             return
         }
 
-        // Setup video frame routing to Gemini Live
-        glassesManager.onVideoFrame = { [weak geminiLive] image in
+        // Setup video frame routing to the live backend
+        glassesManager.onVideoFrame = { [weak service] image in
             if let jpegData = image.jpegData(compressionQuality: 0.6) {
-                geminiLive?.sendVideoFrame(imageData: jpegData)
+                service?.sendVideoFrame(imageData: jpegData)
             }
         }
 
         isLiveVideoMode = true
         agentState = .liveVideo
 
-        print("[VoiceAgentView] ✓ Live video mode active - Gemini handling audio + video")
+        print("[VoiceAgentView] ✓ Live video mode active - \(label) handling audio + video")
 
         // Announce to user
         ttsService.speak("Live video mode active")
+    }
+
+    /// Resolve which live-video backend to use, or nil if none is configured.
+    /// - OpenAI selected + configured → OpenAI Realtime
+    /// - otherwise Gemini if configured (default video provider), else OpenAI if configured.
+    private func resolveLiveService() -> (service: any LiveVideoService, label: String)? {
+        let settings = settingsManager.settings
+        if settings.aiBackend == .openAI && settings.isOpenAIConfigured {
+            return (openAIRealtime, "OpenAI Realtime")
+        }
+        if settings.isGeminiConfigured {
+            return (geminiLive, "Gemini Live")
+        }
+        if settings.isOpenAIConfigured {
+            return (openAIRealtime, "OpenAI Realtime")
+        }
+        return nil
     }
 
     /// Stop live video mode - return to OpenClaw
@@ -1147,8 +1181,9 @@ struct VoiceAgentView: View {
         // Stop audio playback
         audioPlayback.teardown()
 
-        // Disconnect Gemini Live
-        await geminiLive.disconnect()
+        // Disconnect the active live backend (Gemini or OpenAI Realtime)
+        await activeLiveService?.disconnect()
+        activeLiveService = nil
 
         // Stop glasses streaming
         if glassesManager.isStreaming {
@@ -1182,15 +1217,15 @@ struct VoiceAgentView: View {
         ttsService.speak("Live video mode ended")
     }
 
-    /// Setup Gemini Live callbacks for audio/transcription
-    private func setupGeminiLiveCallbacks() {
-        // Audio from Gemini → playback
-        geminiLive.onAudioReceived = { [weak audioPlayback] data in
+    /// Setup live backend callbacks for audio/transcription (Gemini Live or OpenAI Realtime)
+    private func setupLiveVideoCallbacks(_ service: any LiveVideoService) {
+        // Audio from the model → playback
+        service.onAudioReceived = { [weak audioPlayback] data in
             audioPlayback?.playAudio(data: data)
         }
 
         // Transcription updates - also check for stop commands
-        geminiLive.onInputTranscription = { text in
+        service.onInputTranscription = { text in
             Task { @MainActor in
                 self.userTranscript = text
 
@@ -1198,34 +1233,34 @@ struct VoiceAgentView: View {
                 let lowerText = text.lowercased()
                 let stopKeywords = ["stop video", "stop streaming", "stop live", "end video",
                                    "exit video", "disable video", "stop the video", "end live",
-                                   // Hindi fallbacks (Gemini sometimes transcribes English as Hindi)
+                                   // Hindi fallbacks (models sometimes transcribe English as Hindi)
                                    "स्टॉप", "वीडियो बंद", "बंद करो", "रुको"]
 
                 let isStopCommand = stopKeywords.contains { lowerText.contains($0) }
 
                 if isStopCommand && self.isLiveVideoMode {
-                    print("[VoiceAgentView] Stop command detected in Gemini transcription: \(text)")
+                    print("[VoiceAgentView] Stop command detected in transcription: \(text)")
                     await self.stopLiveVideoMode()
                 }
             }
         }
 
-        geminiLive.onOutputTranscription = { text in
+        service.onOutputTranscription = { text in
             Task { @MainActor in
                 self.aiTranscript = text
             }
         }
 
         // Turn complete
-        geminiLive.onTurnComplete = {
+        service.onTurnComplete = {
             // Still in live mode, keep listening
         }
 
         // Disconnection - handle reconnection or mode exit
-        geminiLive.onDisconnected = {
+        service.onDisconnected = {
             Task { @MainActor in
                 if self.isLiveVideoMode {
-                    print("[VoiceAgentView] Gemini Live disconnected unexpectedly")
+                    print("[VoiceAgentView] Live backend disconnected unexpectedly")
                     await self.stopLiveVideoMode()
                 }
             }
