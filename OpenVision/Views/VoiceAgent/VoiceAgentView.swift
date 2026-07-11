@@ -46,6 +46,11 @@ struct VoiceAgentView: View {
     /// True when voice recognition is ready (audio engine running)
     @State private var isVoiceReady = false
 
+    /// Sentence-streaming TTS (Apple only): how many characters of the streamed reply have
+    /// already been handed to the speech queue, and whether a streamed utterance is open.
+    @State private var ttsStreamSpokenChars = 0
+    @State private var ttsStreaming = false
+
 
     // MARK: - Agent State
 
@@ -708,8 +713,12 @@ struct VoiceAgentView: View {
             if self.ttsService.isSpeaking {
                 print("[VoiceAgentView] Stopping TTS due to wake word interrupt")
                 self.ttsService.stop()
+                self.ttsStreaming = false   // keep view flag in sync with the cleared stream
                 KokoroTTSService.shared.stop()
                 self.audioPlayback.stop()
+                // Cancel any in-flight on-device generation too — otherwise its next streamed
+                // token would immediately restart speech we just stopped.
+                GemmaLocalService.shared.interrupt()
                 self.agentState = .listening
             }
 
@@ -791,21 +800,45 @@ struct VoiceAgentView: View {
             guard self.isSessionActive || self.isLiveVideoMode else { return }
             // Show tokens as they stream so it doesn't look stuck on "thinking".
             self.aiTranscript = partial
+            // Apple TTS: start speaking completed sentences as they arrive (pipeline speech
+            // behind generation) instead of waiting for the whole reply. Big perceived speedup,
+            // and Apple TTS isn't on the GPU so it doesn't fight the on-device model.
+            if self.usingAppleTTS { self.feedStreamingSpeech(partial, isFinal: false) }
         }
         GemmaLocalService.shared.onAgentMessage = { (message: String) in
             // In local live video mode replies must flow even if the session timer lapsed
             // while the user was silently looking around.
             guard self.isSessionActive || self.isLiveVideoMode else { return }
             self.aiTranscript = message
-            self.speakResponse(message)
+            if self.usingAppleTTS {
+                // Flush any unspoken tail and close the streamed utterance session.
+                self.feedStreamingSpeech(message, isFinal: true)
+            } else {
+                // Kokoro (on-device neural, GPU): synthesize the full reply after generation —
+                // keeps it off the GPU while the model is still decoding.
+                self.speakResponse(message)
+            }
         }
         GemmaLocalService.shared.onProcessingChanged = { (isProcessing: Bool) in
             if isProcessing {
                 self.agentState = .thinking
-            } else if self.agentState == .thinking && !self.ttsService.isSpeaking {
-                // Return to the live video indicator, not plain listening, while in live mode.
-                self.agentState = self.isLiveVideoMode ? .liveVideo
-                    : (self.isSessionActive ? .listening : .idle)
+                // New reply: reset the sentence-streaming cursor for a clean start.
+                self.ttsStreaming = false
+                self.ttsStreamSpokenChars = 0
+            } else {
+                // Generation ended (always fires via defer, even when interrupted/superseded).
+                // If a streamed utterance is still open, onAgentMessage never fired to close it —
+                // close it here so streamingActive/isSpeaking don't stick true and freeze the
+                // wake-word listener (queued sentences still drain and reset isSpeaking).
+                if self.ttsStreaming {
+                    self.ttsService.endStreaming()
+                    self.ttsStreaming = false
+                }
+                if self.agentState == .thinking && !self.ttsService.isSpeaking {
+                    // Return to the live video indicator, not plain listening, while in live mode.
+                    self.agentState = self.isLiveVideoMode ? .liveVideo
+                        : (self.isSessionActive ? .listening : .idle)
+                }
             }
         }
 
@@ -1425,10 +1458,30 @@ struct VoiceAgentView: View {
             speakResponse("This on-device model is text only. For camera questions, select SmolVLM2 as your local model, or switch to Gemini or OpenClaw in Settings.")
             return
         }
-        switch await llm.routeCommand(command) {
+        // Route the command. On the local backend with Apple TTS, stream the answer: speak
+        // sentences as they generate. Face/tool routes emit JSON starting with "{", so we only
+        // begin speaking once the streamed output's first non-space char proves it's a plain
+        // answer — never for a structured route.
+        let result: LocalAgent.RouteResult
+        if let gemma = llm as? GemmaLocalService, usingAppleTTS {
+            ttsStreaming = false
+            ttsStreamSpokenChars = 0
+            result = await gemma.routeCommandStreaming(command) { cumulative in
+                let lead = cumulative.trimmingCharacters(in: .whitespacesAndNewlines).first
+                guard let lead, lead != "{" else { return }   // JSON route → don't speak
+                self.feedStreamingSpeech(cumulative, isFinal: false)
+            }
+        } else {
+            result = await llm.routeCommand(command)
+        }
+
+        switch result {
         case .face(let intent):
+            // Safety: if we mis-started streaming (answer contained a stray "{"), cancel it.
+            if ttsStreaming { ttsService.stop(); ttsStreaming = false }
             await handleFaceIntent(intent)
         case .webSearch(let query):
+            if ttsStreaming { ttsService.stop(); ttsStreaming = false }
             NSLog("[OV] web search: \"%@\"", query)
             var result = await WebSearchService.search(query)
             // Agentic retry: if the first query found nothing, let the model reformulate once.
@@ -1437,10 +1490,14 @@ struct VoiceAgentView: View {
                 result = await WebSearchService.search(better)
             }
             let answer = await llm.answerWithSearchResult(question: command, result: result)
-            speakResponse(answer)
+            speakResponse(answer)   // separate generation — not streamed here
             ConversationContext.shared.record(user: command, assistant: answer)
         case .answer(let text):
-            speakResponse(text)
+            if ttsStreaming {
+                feedStreamingSpeech(text, isFinal: true)   // flush the tail, close the session
+            } else {
+                speakResponse(text)   // Kokoro, or non-Gemma backend
+            }
             ConversationContext.shared.record(user: command, assistant: text)
         }
         agentState = isSessionActive ? .listening : .idle
@@ -1669,6 +1726,69 @@ struct VoiceAgentView: View {
     }
 
     // MARK: - TTS Integration
+
+    /// True when the active speech engine is Apple's system voice (not Kokoro). Apple TTS runs on
+    /// a system audio service — not the Metal GPU — so it can pipeline speech while the on-device
+    /// model is still generating, with no resource contention.
+    private var usingAppleTTS: Bool {
+        !(settingsManager.settings.ttsEngine == .kokoro && KokoroTTSService.shared.isModelReady)
+    }
+
+    /// Feed the streamed reply to Apple TTS sentence-by-sentence. `cumulative` is the full text so
+    /// far (the local model emits a growing snapshot each token). On non-final calls we speak only
+    /// the sentences that have fully completed; on the final call we flush whatever remains.
+    private func feedStreamingSpeech(_ cumulative: String, isFinal: Bool) {
+        // Open a streamed utterance session on first content.
+        if !ttsStreaming {
+            guard !cumulative.isEmpty else { return }
+            ttsStreaming = true
+            ttsStreamSpokenChars = 0
+            ttsService.beginStreaming()
+        }
+
+        // The portion not yet handed to the speech queue.
+        let spokenClamped = min(ttsStreamSpokenChars, cumulative.count)
+        let start = cumulative.index(cumulative.startIndex, offsetBy: spokenClamped)
+        let pending = cumulative[start...]
+
+        if isFinal {
+            let tail = pending.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !tail.isEmpty { ttsService.speakChunk(tail) }
+            ttsStreamSpokenChars = cumulative.count
+            ttsService.endStreaming()
+            ttsStreaming = false
+            return
+        }
+
+        // Speak everything up to the last completed sentence boundary in the pending text.
+        guard let boundary = lastSentenceBoundary(in: String(pending)) else { return }
+        let pendingStr = String(pending)
+        let sentence = String(pendingStr[..<boundary]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard sentence.count >= 2 else { return }   // don't voice a stray "." or "?"
+        ttsService.speakChunk(sentence)
+        ttsStreamSpokenChars += pendingStr.distance(from: pendingStr.startIndex, to: boundary)
+    }
+
+    /// Index just past the last sentence terminator (. ! ? or newline) in `s`, or nil if none.
+    /// A `.`/`!`/`?` only counts when followed by whitespace or end-of-text, so decimals like
+    /// "2.5" and abbreviations don't get split mid-number.
+    private func lastSentenceBoundary(in s: String) -> String.Index? {
+        let terminators: Set<Character> = [".", "!", "?"]
+        var boundary: String.Index? = nil
+        var i = s.startIndex
+        while i < s.endIndex {
+            let c = s[i]
+            let next = s.index(after: i)
+            if c == "\n" {
+                boundary = next
+            } else if terminators.contains(c) {
+                let followedByBreak = next == s.endIndex || s[next] == " " || s[next] == "\n"
+                if followedByBreak { boundary = next }
+            }
+            i = next
+        }
+        return boundary
+    }
 
     /// Speak AI response via TTS
     private func speakResponse(_ text: String) {
