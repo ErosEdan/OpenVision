@@ -99,28 +99,25 @@ struct VoiceAgentView: View {
             ParticleEffect(particleCount: 30)
                 .opacity(0.5)
 
-            // Main content
+            // Main content — the orb stays vertically centered and STABLE. The transcript is a
+            // separate overlay (below) so it can never push the orb around.
             VStack(spacing: 0) {
-                // Top bar
                 topBar
                     .padding(.top, 8)
-
                 Spacer()
-
-                // Center: Visualizer and status
                 centerContent
-
                 Spacer()
+            }
 
-                // Transcript area
-                if settingsManager.settings.showTranscripts && (!userTranscript.isEmpty || !aiTranscript.isEmpty || agentState == .thinking) {
+            // Transcript floats over the bottom; growing text stays inside its own card and doesn't
+            // move the orb.
+            if settingsManager.settings.showTranscripts && (!userTranscript.isEmpty || !aiTranscript.isEmpty || agentState == .thinking) {
+                VStack {
+                    Spacer()
                     transcriptArea
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .padding(.bottom, 28)
                 }
-
-                // Bottom controls
-                bottomControls
-                    .padding(.bottom, 32)
+                .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
             // Error overlay
@@ -128,9 +125,12 @@ struct VoiceAgentView: View {
                 errorOverlay(error)
             }
         }
-        .animation(.spring(response: 0.4), value: agentState)
-        .animation(.spring(response: 0.4), value: userTranscript)
-        .animation(.spring(response: 0.4), value: aiTranscript)
+        // Animate the state text and the transcript's appear/disappear only — NOT every streamed
+        // token (the old .spring on userTranscript/aiTranscript sprang the whole view and jostled
+        // the orb on every word).
+        .animation(.easeInOut(duration: 0.3), value: agentState)
+        .animation(.easeInOut(duration: 0.35), value: userTranscript.isEmpty)
+        .animation(.easeInOut(duration: 0.35), value: aiTranscript.isEmpty)
         .onAppear {
             setupVoiceCommandService()
             setupGlassesCallbacks()
@@ -238,17 +238,15 @@ struct VoiceAgentView: View {
                         }
                     }
                 }
-            case .listening:
+            case .listening, .conversationMode:
                 // Keep the live indicator up in live video mode (don't clobber it back to
                 // plain .listening, which would let the next idle tear the session down).
                 if isLiveVideoMode {
                     agentState = .liveVideo
-                } else if isSessionActive {
-                    agentState = .listening
-                }
-            case .conversationMode:
-                if isLiveVideoMode {
-                    agentState = .liveVideo
+                } else if ttsService.isSpeaking || KokoroTTSService.shared.isSpeaking {
+                    // The recognizer restarts (→ conversation mode) mid-reply for barge-in; don't
+                    // let that flip the UI to "Listening" while the assistant is still speaking.
+                    agentState = .speaking
                 } else if isSessionActive {
                     agentState = .listening
                 }
@@ -325,60 +323,60 @@ struct VoiceAgentView: View {
 
     // MARK: - Center Content
 
+    /// Map the agent state to the orb's visual mode.
+    private var orbMode: SwirlOrb.Mode {
+        switch agentState {
+        case .listening: return .listening
+        case .speaking: return .speaking
+        case .thinking, .toolRunning, .connecting: return .thinking
+        case .idle, .liveVideo: return .idle
+        }
+    }
+
     private var centerContent: some View {
-        VStack(spacing: 32) {
-            // Status hints
-            if agentState == .idle && settingsManager.settings.wakeWordEnabled {
-                if isVoiceReady {
-                    Text("Say \"\(settingsManager.settings.wakeWord)\" to start")
-                        .font(.subheadline)
-                        .foregroundColor(.white.opacity(0.6))
-                        .transition(.opacity)
-                } else {
-                    HStack(spacing: 8) {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            .scaleEffect(0.8)
-                        Text("Initializing voice...")
-                            .font(.subheadline)
-                            .foregroundColor(.white.opacity(0.6))
+        VStack(spacing: 28) {
+            // Heading / status prompt
+            Group {
+                if agentState == .liveVideo {
+                    VStack(spacing: 6) {
+                        Text(settingsManager.settings.backendDisplayName)
+                            .font(.headline)
+                            .foregroundColor(Theme.heading)
+                        Text("Say \"stop video\" to exit")
+                            .font(.caption)
+                            .foregroundColor(Theme.textSecondary)
                     }
-                    .transition(.opacity)
+                } else if agentState == .idle && settingsManager.settings.wakeWordEnabled {
+                    VStack(spacing: 8) {
+                        Text("What can I see?")
+                            .font(.system(size: 30, weight: .bold, design: .rounded))
+                            .foregroundColor(Theme.heading)
+                        if isVoiceReady {
+                            Text("Say \"\(settingsManager.settings.wakeWord)\" or tap the orb")
+                                .font(.subheadline)
+                                .foregroundColor(Theme.textSecondary)
+                        } else {
+                            HStack(spacing: 8) {
+                                ProgressView().tint(Theme.accent).scaleEffect(0.8)
+                                Text("Initializing voice…")
+                                    .font(.subheadline)
+                                    .foregroundColor(Theme.textSecondary)
+                            }
+                        }
+                    }
                 }
-            } else if agentState == .liveVideo {
-                VStack(spacing: 4) {
-                    Text("Gemini Live")
-                        .font(.headline)
-                        .foregroundColor(.white)
-
-                    Text("Say \"stop video\" to exit")
-                        .font(.caption)
-                        .foregroundColor(.white.opacity(0.6))
-                }
-                .transition(.opacity)
             }
+            .transition(.opacity)
 
-            // Waveform visualizer
-            WaveformVisualizer(
-                isActive: agentState == .listening || agentState == .speaking,
-                intensity: audioLevel
-            )
-            .frame(height: 80)
-            .padding(.horizontal, 40)
-
-            // Main orb button
-            GlowingOrbButton(
-                isActive: isSessionActive,
-                isProcessing: agentState == .thinking || agentState == .toolRunning
-            ) {
-                toggleSession()
-            }
+            // The assistant identity: swirling emerald orb (tap to start/stop a session)
+            SwirlOrb(mode: orbMode, size: 250)
+                .onTapGesture { toggleSession() }
 
             // Status text
             Text(agentState.displayText)
                 .font(.title3)
                 .fontWeight(.medium)
-                .foregroundColor(.white)
+                .foregroundColor(Theme.textPrimary)
 
             // Tool status
             if let tool = currentToolName, agentState == .toolRunning {
@@ -390,46 +388,23 @@ struct VoiceAgentView: View {
 
     // MARK: - Transcript Area
 
+    // Bubbles float directly over the background (no outer card box — the old GlassCard wrapper
+    // was a mostly-empty gray slab).
     private var transcriptArea: some View {
-        GlassCard(cornerRadius: 24, opacity: 0.1) {
-            VStack(spacing: 16) {
-                TranscriptView(
-                    userText: userTranscript,
-                    aiText: aiTranscript,
-                    isAIStreaming: agentState == .speaking
-                )
-            }
-            .padding(20)
-        }
-        .padding(.horizontal)
-        .frame(maxHeight: 200)
+        TranscriptView(
+            userText: userTranscript,
+            aiText: aiTranscript,
+            isAIStreaming: agentState == .speaking
+        )
+        .padding(.horizontal, 20)
     }
 
     // MARK: - Bottom Controls
 
-    private var bottomControls: some View {
-        HStack(spacing: 24) {
-            // Camera button
-            FloatingActionButton(
-                icon: "camera.fill",
-                color: .blue,
-                isEnabled: glassesManager.isStreaming || true // Enable for iPhone fallback
-            ) {
-                capturePhoto()
-            }
-
-            // Main button is in center content
-
-            // Settings quick access
-            FloatingActionButton(
-                icon: "slider.horizontal.3",
-                color: .purple,
-                isEnabled: true
-            ) {
-                // Quick settings
-            }
-        }
-    }
+    // Bottom controls intentionally removed: the old camera/quick-settings floating buttons were
+    // non-functional/redundant (the camera flow is voice-driven; Settings lives in the tab bar).
+    // Interaction is now the orb (tap) + wake word, matching the reference design.
+    private var bottomControls: some View { EmptyView() }
 
     // MARK: - Error Overlay
 
@@ -1545,7 +1520,12 @@ struct VoiceAgentView: View {
             }
             ConversationContext.shared.record(user: command, assistant: text)
         }
-        agentState = isSessionActive ? .listening : .idle
+        // Generation finishes well before the voice does (several sentences stay queued in TTS).
+        // Don't stomp the state back to .listening while the reply is still being spoken — the
+        // TTS-finished observers handle that transition at the right moment.
+        if !ttsService.isSpeaking && !KokoroTTSService.shared.isSpeaking {
+            agentState = isSessionActive ? .listening : .idle
+        }
     }
 
     /// Carry out a face action (camera capture + Apple Vision), shared by the cloud-backend

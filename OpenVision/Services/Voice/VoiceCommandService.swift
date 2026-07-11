@@ -476,36 +476,43 @@ final class VoiceCommandService: ObservableObject {
                 return
             }
 
-            if allowInterrupt && detectWakeWord(in: transcription, bypassCooldown: true) {
-                print("[VoiceCommand] Wake word detected during TTS - interrupting")
+            if allowInterrupt && detectWakeWord(in: transcription, bypassCooldown: true)
+                && wakeWordAtStart(transcription) {
+                // A BARE "Ok Vision" with nothing after it, mid-reply, is almost always the mic
+                // hallucinating the wake word from the reply audio the speaker is playing (echo) —
+                // NOT a deliberate interrupt. Real interrupts carry a follow-up ("Ok Vision, what
+                // about Mars?"). Require that command; otherwise ignore and let the reply finish.
+                // (To simply silence a reply, "Ok Vision stop" is handled by the stop-phrase branch
+                // above.)
+                let command = extractCommandAfterWakeWord(transcription)
+                guard !command.isEmpty else { return }
+
+                print("[VoiceCommand] Wake word + command during TTS - interrupting: '\(command)'")
 
                 // Notify to stop TTS immediately
                 onWakeWordDetected?()
 
-                // Extract command after wake word
-                let command = extractCommandAfterWakeWord(transcription)
-                print("[VoiceCommand] Extracted command: '\(command)'")
-
                 // Switch to listening mode - like xmeta's isCapturingCommand = true
                 state = .listening
                 currentTranscription = command
-                hasSpokenThisTurn = !command.isEmpty
+                hasSpokenThisTurn = true
 
                 // Start silence timer to wait for user to finish speaking
                 resetSilenceTimer()
 
-                // If result is already final and we have a command, process it
-                if result.isFinal && !command.isEmpty {
+                // If result is already final, process it
+                if result.isFinal {
                     print("[VoiceCommand] Result is final, processing command immediately")
                     handleCommandComplete(command)
                 }
                 return
             }
 
-            // Check for barge-in (only if not paused - e.g., during TTS playback)
-            if !isBargeInPaused && detectSpeechStart(in: transcription) {
-                handleBargeIn()
-            }
+            // NOTE: no naive "any speech" barge-in here. detectSpeechStart is just `count > 3`, so
+            // during the processing→speaking window it fired on our OWN audio — the command echo
+            // (before TTS starts, when isBargeInPaused is still false) and the reply the mic hears
+            // back — flipping the UI to "Listening" mid-reply and tearing the session down. Deliberate
+            // interruption is handled above: "Ok Vision …" (wake word at start) or a stop phrase.
         }
     }
 
@@ -519,6 +526,28 @@ final class VoiceCommandService: ObservableObject {
         if lower.contains("video") || lower.contains("stream") { return false }
         let stopWords = ["stop", "be quiet", "shut up", "silence", "quiet", "enough", "cancel"]
         return stopWords.contains { lower.contains($0) }
+    }
+
+    /// True when a wake-word variation sits at (or very near) the START of the transcript — i.e. a
+    /// deliberate "Ok Vision …" barge-in. During TTS the mic also hears the reply itself, whose
+    /// transcription can incidentally contain a "…vision…" buried mid-sentence; requiring the wake
+    /// word up front rejects those phantoms while still catching a real interrupt.
+    private func wakeWordAtStart(_ text: String) -> Bool {
+        let lower = text.lowercased()
+        let variations = [
+            wakeWord.lowercased(),
+            "ok vision", "okay vision", "o.k. vision", "o k vision",
+            "hey vision", "hi vision",
+            "a vision", "heavy vision", "have vision", "obey vision", "oak vision"
+        ]
+        for v in variations {
+            if let r = lower.range(of: v) {
+                // Characters of speech before the wake word. A little leeway ("uh, ok vision")
+                // is fine; a whole sentence in front of it means it's echo, not a barge-in.
+                if lower.distance(from: lower.startIndex, to: r.lowerBound) <= 12 { return true }
+            }
+        }
+        return false
     }
 
     /// Detect wake word in transcription
@@ -624,6 +653,13 @@ final class VoiceCommandService: ObservableObject {
 
         // Clear transcription to prevent re-sending the same command
         currentTranscription = ""
+
+        // Reset the recognizer's OWN buffer too. `currentTranscription = ""` only clears our copy;
+        // the live SFSpeechRecognitionResult keeps accumulating the whole utterance. Without this,
+        // the captured command ("…sun and the moon") lingers in the buffer during TTS, and a single
+        // misheard "Okay Vision" (from the reply audio / ambient) tacks onto it and false-fires the
+        // wake-word interrupt — cutting the reply off and flipping the UI back to "Listening".
+        restartRecognition()
 
         onCommandCaptured?(command)
     }
