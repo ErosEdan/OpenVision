@@ -34,6 +34,10 @@ enum GemmaLocalModel: String, CaseIterable, Identifiable, Codable {
     case qwen3B          // Qwen 2.5 3B — strong text, still light
     case e2b             // Gemma 4 E2B — vision-capable, heaviest
     case smolVLM2_2B     // SmolVLM2 2.2B — lighter vision model
+    case fastVLM05B      // Apple FastVLM 0.5B — fastest vision, real-time
+    // NOTE: FastVLM 1.5B is intentionally absent — no public MLX checkpoint loads in mlx-swift-lm
+    // (the community conversions ship non-reparameterized FastViTHD weights that fail key lookup).
+    // The config-injection + retry infra below is kept for when a correct 1.5B conversion exists.
 
     var id: String { rawValue }
 
@@ -44,6 +48,7 @@ enum GemmaLocalModel: String, CaseIterable, Identifiable, Codable {
         case .qwen3B: return "Qwen 2.5 3B"
         case .e2b: return "Gemma 4 E2B"
         case .smolVLM2_2B: return "SmolVLM2 2.2B"
+        case .fastVLM05B: return "FastVLM 0.5B"
         }
     }
 
@@ -55,6 +60,10 @@ enum GemmaLocalModel: String, CaseIterable, Identifiable, Codable {
         case .qwen3B: return "mlx-community/Qwen2.5-3B-Instruct-4bit"
         case .e2b: return "mlx-community/gemma-4-E2B-it-4bit"
         case .smolVLM2_2B: return "mlx-community/SmolVLM2-2.2B-Instruct-mlx"
+        // FastVLM: Apple's real-time VLM (FastViTHD encoder). 0.5B is the factory's reference
+        // build (config matches out of the box); the 1.5B community 8-bit needs its
+        // preprocessor_config's processor_class patched to FastVLMProcessor (see patch on load).
+        case .fastVLM05B: return "mlx-community/FastVLM-0.5B-bf16"
         }
     }
 
@@ -65,24 +74,33 @@ enum GemmaLocalModel: String, CaseIterable, Identifiable, Codable {
         case .qwen3B: return "3B • ~1.9 GB • strongest text, still light"
         case .e2b: return "2B • ~3.6 GB • vision-capable, heaviest"
         case .smolVLM2_2B: return "2.2B • ~2.6 GB • on-device vision: photos + live video"
+        case .fastVLM05B: return "0.5B • ~1.0 GB • Apple FastVLM — fastest real-time vision"
         }
     }
 
     /// Vision models load via VLMModelFactory; text models via LLMModelFactory.
     var isVLM: Bool {
         switch self {
-        case .e2b, .smolVLM2_2B: return true
+        case .e2b, .smolVLM2_2B, .fastVLM05B: return true
         case .qwen05B, .gemma2_2B, .qwen3B: return false
         }
     }
 
     /// Whether we let this model *use* its vision on-device. Distinct from `isVLM`: Gemma 4 E2B
     /// is a VLM but its image encoding pushed memory to the ~6GB jetsam limit and crashed, so it
-    /// stays text-only. SmolVLM2 is ~1GB lighter and built for image/video understanding — the
-    /// only model currently trusted with on-device photos (with input resized to keep the
-    /// encoder cheap; see sendMessage).
+    /// stays text-only. SmolVLM2 and Apple's FastVLM are trusted for on-device photos/live video —
+    /// FastVLM's FastViTHD encoder is designed to be fast and memory-light at high resolution.
     var supportsOnDeviceVision: Bool {
-        self == .smolVLM2_2B
+        switch self {
+        case .smolVLM2_2B, .fastVLM05B: return true
+        default: return false
+        }
+    }
+
+    /// True for the FastVLM family (used to keep FastVLM at native resolution rather than the
+    /// SmolVLM downscale, and to trigger the 1.5B processor-config patch).
+    var isFastVLM: Bool {
+        self == .fastVLM05B
     }
 
     static func from(modelId: String) -> GemmaLocalModel {
@@ -185,6 +203,112 @@ final class GemmaLocalService: ObservableObject {
         }
     }
 
+    // MARK: - FastVLM processor patch (community 1.5B config fix)
+
+    /// The community FastVLM-1.5B MLX export declares processor_class "LlavaProcessor" /
+    /// image_processor_type "CLIPImageProcessor", so mlx-swift-lm's factory (which keys the vision
+    /// processor by "FastVLMProcessor") can't resolve it and the load fails. The image fields the
+    /// FastVLM processor actually decodes (image_mean/std, crop_size) are already identical to the
+    /// reference FastVLM config, so we only rewrite the two type strings. Idempotent; safe against
+    /// re-download (the HF cache is existence-checked, so a patched blob is reused).
+    nonisolated private static func patchFastVLMProcessorConfig() {
+        let fm = FileManager.default
+        for dir in [FileManager.SearchPathDirectory.cachesDirectory, .applicationSupportDirectory] {
+            guard let base = fm.urls(for: dir, in: .userDomainMask).first else { continue }
+            let hf = base.appendingPathComponent("huggingface", isDirectory: true)
+            guard let en = fm.enumerator(at: hf, includingPropertiesForKeys: nil) else { continue }
+            for case let url as URL in en
+            where url.lastPathComponent == "preprocessor_config.json"
+                && url.path.localizedCaseInsensitiveContains("fastvlm") {
+                patchProcessorClass(at: url)
+            }
+        }
+    }
+
+    nonisolated private static func patchProcessorClass(at url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              var json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        guard (json["processor_class"] as? String) != "FastVLMProcessor" else { return }
+        let previous = (json["processor_class"] as? String) ?? "nil"
+        json["processor_class"] = "FastVLMProcessor"
+        json["image_processor_type"] = "FastVLMImageProcessor"
+        guard let out = try? JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]) else { return }
+        do {
+            try out.write(to: url)
+            NSLog("[OV] FastVLM preprocessor patched at %@: processor_class %@ -> FastVLMProcessor",
+                  url.lastPathComponent, previous)
+        } catch {
+            NSLog("[OV] FastVLM preprocessor patch FAILED: %@", "\(error)")
+        }
+    }
+
+    /// The FastViTHD vision encoder is identical across all FastVLM sizes (0.5B/1.5B/7B) — only the
+    /// language model scales. Some community MLX exports (e.g. FastVLM-1.5B-MLX-8bit) serialize an
+    /// EMPTY `vision_config: {}`, which makes mlx-swift-lm's decoder throw on the first missing field
+    /// (`vision_config.cls_ratio`). This is the reference FastViTHD config (from the working 0.5B
+    /// build) we inject when the export dropped it. `mm_vision_tower` is `mobileclip_l_1024` on both
+    /// sizes, confirming the encoder matches, so the injected config is correct.
+    nonisolated private static var fastViTHDVisionConfig: [String: Any] {
+        [
+            "cls_ratio": 2.0,
+            "down_patch_size": 7,
+            "down_stride": 2,
+            "downsamples": [true, true, true, true, true],
+            "embed_dims": [96, 192, 384, 768, 1536],
+            "hidden_size": 1024,
+            "image_size": 1024,
+            "intermediate_size": 3072,
+            "layer_scale_init_value": 1e-05,
+            "layers": [2, 12, 24, 4, 2],
+            "mlp_ratios": [4, 4, 4, 4, 4],
+            "num_classes": 1000,
+            "patch_size": 64,
+            "pos_embs_shapes": [NSNull(), NSNull(), NSNull(), [7, 7], [7, 7]],
+            "projection_dim": 768,
+            "repmixer_kernel_size": 3,
+            "token_mixers": ["repmixer", "repmixer", "repmixer", "attention", "attention"],
+        ]
+    }
+
+    /// Inject the FastViTHD `vision_config` into any FastVLM `config.json` whose export left it empty.
+    nonisolated private static func patchFastVLMConfigJSON() {
+        let fm = FileManager.default
+        for dir in [FileManager.SearchPathDirectory.cachesDirectory, .applicationSupportDirectory] {
+            guard let base = fm.urls(for: dir, in: .userDomainMask).first else { continue }
+            let hf = base.appendingPathComponent("huggingface", isDirectory: true)
+            guard let en = fm.enumerator(at: hf, includingPropertiesForKeys: nil) else { continue }
+            for case let url as URL in en
+            where url.lastPathComponent == "config.json"
+                && url.path.localizedCaseInsensitiveContains("fastvlm") {
+                injectFastVLMVisionConfig(at: url)
+            }
+        }
+    }
+
+    nonisolated private static func injectFastVLMVisionConfig(at url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              var json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
+        // Only inject when it's actually missing — never clobber a config that already has it (0.5B).
+        let existing = json["vision_config"] as? [String: Any]
+        guard existing?["cls_ratio"] == nil else { return }
+        json["vision_config"] = fastViTHDVisionConfig
+        guard let out = try? JSONSerialization.data(withJSONObject: json, options: [.sortedKeys]) else { return }
+        do {
+            try out.write(to: url)
+            NSLog("[OV] FastVLM config patched at %@: injected FastViTHD vision_config", url.path)
+        } catch {
+            NSLog("[OV] FastVLM config patch FAILED: %@", "\(error)")
+        }
+    }
+
+    /// Apply every downloaded-config fixup (SmolVLM memory cap + FastVLM processor class + FastVLM
+    /// empty vision_config).
+    nonisolated private static func patchDownloadedVisionConfigs() {
+        patchSmolVLMPreprocessorConfig()
+        patchFastVLMProcessorConfig()
+        patchFastVLMConfigJSON()
+    }
+
     // MARK: - Download (model manager)
 
     /// Download a model snapshot to disk (idempotent — skipped if already cached).
@@ -192,14 +316,24 @@ final class GemmaLocalService: ObservableObject {
         downloadProgress = 0
         // loadContainer fetches the snapshot if missing; reuse it as the download path.
         // Patch first in case a snapshot already exists — the config is read during load.
-        Self.patchSmolVLMPreprocessorConfig()
-        _ = try await loadModelContainer(modelId: model.modelId) { [weak self] p in
-            self?.downloadProgress = p
-            onProgress(p)
+        Self.patchDownloadedVisionConfigs()
+        do {
+            _ = try await loadModelContainer(modelId: model.modelId) { [weak self] p in
+                self?.downloadProgress = p
+                onProgress(p)
+            }
+        } catch {
+            // A fresh snapshot's RAW config may be rejected before we can touch it (FastVLM 1.5B
+            // ships an empty vision_config). The files are on disk now, so patch and retry once —
+            // the existence-checked cache reuses them, so this is a re-parse, not a re-download.
+            NSLog("[OV] load failed (%@) — patching downloaded configs and retrying", "\(error)")
+            Self.patchDownloadedVisionConfigs()
+            _ = try await loadModelContainer(modelId: model.modelId) { [weak self] p in
+                self?.downloadProgress = p
+                onProgress(p)
+            }
         }
-        // Patch again for the fresh-download case (the load above read the stock config, but
-        // connect() re-patches before the container that actually serves requests is loaded).
-        Self.patchSmolVLMPreprocessorConfig()
+        Self.patchDownloadedVisionConfigs()
         downloadProgress = 1
     }
 
@@ -240,12 +374,22 @@ final class GemmaLocalService: ObservableObject {
 
         // Cap SmolVLM's image-splitting resolution BEFORE the load reads the processor config
         // (as shipped it tiles every photo into ~25 vision-encoder inputs → jetsam).
-        Self.patchSmolVLMPreprocessorConfig()
+        Self.patchDownloadedVisionConfigs()
 
         do {
             print("[GemmaLocal] loading container…")
-            let container = try await loadModelContainer(modelId: modelId) { [weak self] p in
-                self?.downloadProgress = p
+            let container: ModelContainer
+            do {
+                container = try await loadModelContainer(modelId: modelId) { [weak self] p in
+                    self?.downloadProgress = p
+                }
+            } catch {
+                // Retry once after re-patching (covers a snapshot whose config wasn't patched yet).
+                NSLog("[OV] connect load failed (%@) — re-patching and retrying", "\(error)")
+                Self.patchDownloadedVisionConfigs()
+                container = try await loadModelContainer(modelId: modelId) { [weak self] p in
+                    self?.downloadProgress = p
+                }
             }
             modelContainer = container
             loadedModelId = modelId
@@ -387,7 +531,14 @@ final class GemmaLocalService: ObservableObject {
 
         // Keep replies short — this is spoken aloud on glasses, so long answers get tiresome
         // (and the TTS cuts off after ~a minute). Aim for a couple of natural sentences.
-        let brevity = "You are a hands-free voice assistant for smart glasses. Reply in 2–4 natural sentences — enough detail to be genuinely useful and give a real sense of things, but brief enough to hear comfortably (around 20–30 seconds). Be specific and concrete, not vague. No lists, no markdown, no preamble; just answer."
+        var brevity = "You are a hands-free voice assistant for smart glasses. Reply in 2–4 natural sentences — enough detail to be genuinely useful and give a real sense of things, but brief enough to hear comfortably (around 20–30 seconds). Be specific and concrete, not vague. No lists, no markdown, no preamble; just answer."
+        // Hallucination defense: SmolVLM confidently invents details it can't see (research puts
+        // its "describe a thing that isn't there" rate near 94%, dropping to ~22% with a grounding
+        // prompt). Anchor it to THIS frame and let it admit uncertainty rather than guess — this is
+        // what stops the live feed from narrating stale/blurry glimpses when the head is moving.
+        if visionImage != nil {
+            brevity += " You are looking through the glasses camera right now. Describe ONLY what is clearly and currently visible in this exact image. If it's blurry, dark, partly out of frame, or you're not certain what something is, say so briefly instead of guessing — never mention objects you aren't confident are actually present."
+        }
         let userSys = SettingsManager.shared.settings.userPrompt
         let systemContent = userSys.isEmpty ? brevity : "\(userSys)\n\n\(brevity)"
 
@@ -398,12 +549,15 @@ final class GemmaLocalService: ObservableObject {
         } else {
             chat.append(.init(role: .user, content: text))
         }
-        // Resize keeps the vision encoder's memory bounded (the jetsam killer was full-resolution
-        // encoding). 512px is plenty for "what am I looking at" over glasses frames.
-        let userInput = UserInput(
-            chat: chat,
-            processing: .init(resize: visionImage != nil ? CGSize(width: 512, height: 512) : nil)
-        )
+        // Resize policy is model-specific:
+        //  • SmolVLM: pre-shrink to 512 so its (patched) tiler stays cheap — the jetsam killer was
+        //    full-resolution encoding.
+        //  • FastVLM: DON'T pre-shrink. Its FastViTHD encoder is built to ingest high-res frames
+        //    cheaply (few visual tokens), so downscaling would throw away its main advantage; let
+        //    its own processor handle sizing.
+        let loadedIsFastVLM = loadedModelId.map { GemmaLocalModel.from(modelId: $0).isFastVLM } ?? false
+        let resize: CGSize? = (visionImage != nil && !loadedIsFastVLM) ? CGSize(width: 512, height: 512) : nil
+        let userInput = UserInput(chat: chat, processing: .init(resize: resize))
 
         // Tag this generation. If a newer request starts, older ones stop and stay silent —
         // prevents a stale reply (e.g. a previous photo's description) bleeding into a new answer.
