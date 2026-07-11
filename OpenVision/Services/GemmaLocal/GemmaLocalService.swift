@@ -78,6 +78,19 @@ enum GemmaLocalModel: String, CaseIterable, Identifiable, Codable {
         }
     }
 
+    /// Approximate full snapshot size, used to estimate download progress from bytes on disk
+    /// (the hub only reports per-FILE progress, useless for a model that is one big safetensors).
+    var expectedDownloadBytes: Int64 {
+        switch self {
+        case .qwen05B: return 400_000_000
+        case .gemma2_2B: return 1_500_000_000
+        case .qwen3B: return 1_900_000_000
+        case .e2b: return 3_600_000_000
+        case .smolVLM2_2B: return 2_600_000_000
+        case .fastVLM05B: return 1_000_000_000
+        }
+    }
+
     /// Vision models load via VLMModelFactory; text models via LLMModelFactory.
     var isVLM: Bool {
         switch self {
@@ -311,27 +324,46 @@ final class GemmaLocalService: ObservableObject {
 
     // MARK: - Download (model manager)
 
+    /// Never lower the visible progress (the two estimators below race).
+    private func bumpDownloadProgress(_ p: Double) {
+        if p > downloadProgress { downloadProgress = p }
+    }
+
     /// Download a model snapshot to disk (idempotent — skipped if already cached).
     func download(_ model: GemmaLocalModel, onProgress: @escaping (Double) -> Void) async throws {
         downloadProgress = 0
+        // The hub's progress callback counts FILES, and a model is mostly one giant safetensors —
+        // so it sits at 0% for the whole download, then jumps to done. Poll the bytes actually on
+        // disk (partial snapshot + CFNetwork in-flight temp files) against the model's expected
+        // size for real, monotonic progress. Capped at 99% until the load truly completes.
+        let modelId = model.modelId
+        let expected = max(model.expectedDownloadBytes, 1)
+        let started = Date()
+        let poller = Task.detached { [weak self] in
+            while !Task.isCancelled {
+                let bytes = Self.inFlightDownloadBytes(for: modelId, since: started)
+                let est = min(0.99, Double(bytes) / Double(expected))
+                await MainActor.run { self?.bumpDownloadProgress(est) }
+                try? await Task.sleep(nanoseconds: 700_000_000)
+            }
+        }
+        defer { poller.cancel() }
+
         // loadContainer fetches the snapshot if missing; reuse it as the download path.
         // Patch first in case a snapshot already exists — the config is read during load.
+        // The hub's own progress callback is deliberately NOT fed into downloadProgress: it emits
+        // a fresh 0→1 fraction per FILE, which made the bar thrash between 1% and 99%. The byte
+        // poller above is the single writer until completion.
         Self.patchDownloadedVisionConfigs()
         do {
-            _ = try await loadModelContainer(modelId: model.modelId) { [weak self] p in
-                self?.downloadProgress = p
-                onProgress(p)
-            }
+            _ = try await loadModelContainer(modelId: model.modelId) { p in onProgress(p) }
         } catch {
             // A fresh snapshot's RAW config may be rejected before we can touch it (FastVLM 1.5B
             // ships an empty vision_config). The files are on disk now, so patch and retry once —
             // the existence-checked cache reuses them, so this is a re-parse, not a re-download.
             NSLog("[OV] load failed (%@) — patching downloaded configs and retrying", "\(error)")
             Self.patchDownloadedVisionConfigs()
-            _ = try await loadModelContainer(modelId: model.modelId) { [weak self] p in
-                self?.downloadProgress = p
-                onProgress(p)
-            }
+            _ = try await loadModelContainer(modelId: model.modelId) { p in onProgress(p) }
         }
         Self.patchDownloadedVisionConfigs()
         downloadProgress = 1
@@ -380,16 +412,15 @@ final class GemmaLocalService: ObservableObject {
             print("[GemmaLocal] loading container…")
             let container: ModelContainer
             do {
-                container = try await loadModelContainer(modelId: modelId) { [weak self] p in
-                    self?.downloadProgress = p
-                }
+                // NOTE: don't write downloadProgress here — connect() can run concurrently with a
+                // download() (wake word stays live behind Settings), and the hub emits a fresh
+                // 0→1 progress per FILE, so a second writer makes the download bar thrash.
+                container = try await loadModelContainer(modelId: modelId) { _ in }
             } catch {
                 // Retry once after re-patching (covers a snapshot whose config wasn't patched yet).
                 NSLog("[OV] connect load failed (%@) — re-patching and retrying", "\(error)")
                 Self.patchDownloadedVisionConfigs()
-                container = try await loadModelContainer(modelId: modelId) { [weak self] p in
-                    self?.downloadProgress = p
-                }
+                container = try await loadModelContainer(modelId: modelId) { _ in }
             }
             modelContainer = container
             loadedModelId = modelId
@@ -467,24 +498,161 @@ final class GemmaLocalService: ObservableObject {
         return urls
     }
 
-    /// Total on-disk size of all downloaded model data, in bytes (0 if none).
-    nonisolated static func downloadedSizeBytes(for modelId: String = "") -> Int64 {
-        modelDataURLs().reduce(0) { $0 + dirSizeBytes($1) }
+    /// Directories on disk belonging to ONE model's snapshot. The hub cache nests the repo id in
+    /// the path (either `models/<org>/<name>` or `models--<org>--<name>` depending on layout), so
+    /// we match top-level-ish directories whose path contains the repo's name. Blobs live inside
+    /// the repo dir in both layouts, so size/delete on these is complete for that model.
+    nonisolated private static func repoDirectories(for modelId: String) -> [URL] {
+        guard let repoName = modelId.split(separator: "/").last.map(String.init), !repoName.isEmpty
+        else { return [] }
+        let fm = FileManager.default
+        var found: [URL] = []
+        for dir in [FileManager.SearchPathDirectory.documentDirectory, .cachesDirectory, .applicationSupportDirectory] {
+            guard let base = fm.urls(for: dir, in: .userDomainMask).first else { continue }
+            let hf = base.appendingPathComponent("huggingface", isDirectory: true)
+            guard let en = fm.enumerator(at: hf, includingPropertiesForKeys: [.isDirectoryKey]) else { continue }
+            for case let url as URL in en
+            where (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+                && url.lastPathComponent.localizedCaseInsensitiveContains(repoName) {
+                found.append(url)
+                en.skipDescendants()   // the whole repo dir matched — don't also match children
+            }
+        }
+        return found
     }
 
-    /// Delete all downloaded model data from disk to free storage. Unloads from memory first.
+    // MARK: - Model store bootstrap (run once, before any HubClient exists)
+
+    /// The permanent home for downloaded models: Application Support (NOT purged by iOS).
+    nonisolated static var modelStoreURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("huggingface/hub", isDirectory: true)
+    }
+
+    /// Point the HuggingFace hub cache at Application Support and clean up download debris.
+    /// The default hub location is `Library/Caches/huggingface/hub`, which iOS purges under
+    /// storage pressure — downloaded weights silently vanished and were re-downloaded on the next
+    /// connect. Interrupted downloads also strand multi-GB `CFNetworkDownload_*.tmp` files (6+ GB
+    /// observed); at launch none can be in flight, so sweep them all.
+    nonisolated static func bootstrapModelStore() {
+        let fm = FileManager.default
+        let store = modelStoreURL
+        try? fm.createDirectory(at: store, withIntermediateDirectories: true)
+
+        // Migrate whatever survives in the old purgeable location (configs/partial snapshots).
+        if let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            let old = caches.appendingPathComponent("huggingface/hub", isDirectory: true)
+            if fm.fileExists(atPath: old.path),
+               let entries = try? fm.contentsOfDirectory(at: old, includingPropertiesForKeys: nil) {
+                for entry in entries {
+                    let dest = store.appendingPathComponent(entry.lastPathComponent)
+                    if !fm.fileExists(atPath: dest.path) {
+                        try? fm.moveItem(at: entry, to: dest)
+                    }
+                }
+                try? fm.removeItem(at: old)
+                NSLog("[OV] model store: migrated old cache → Application Support")
+            }
+        }
+
+        // Multi-GB of weights must not sync to iCloud backups.
+        var storeURL = store
+        var noBackup = URLResourceValues()
+        noBackup.isExcludedFromBackup = true
+        try? storeURL.setResourceValues(noBackup)
+
+        // Redirect the hub library here (read at HubClient init — hence "before any HubClient").
+        setenv("HF_HUB_CACHE", store.path, 1)
+
+        // Sweep orphaned download temps.
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        var freed: Int64 = 0
+        if let items = try? fm.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil) {
+            for item in items where item.lastPathComponent.hasPrefix("CFNetworkDownload_") {
+                freed += dirSizeBytes(item)
+                try? fm.removeItem(at: item)
+            }
+        }
+        if freed > 0 { NSLog("[OV] model store: swept %lld MB of orphaned download temps", freed / 1_048_576) }
+    }
+
+    /// DEBUG: log the hub cache layout (dirs to depth 4 with sizes) so size/delete matching can be
+    /// verified against reality on-device.
+    nonisolated static func debugDumpHubCache() {
+        let fm = FileManager.default
+        for (name, dir) in [("documents", FileManager.SearchPathDirectory.documentDirectory),
+                            ("caches", .cachesDirectory), ("appSupport", .applicationSupportDirectory)] {
+            guard let base = fm.urls(for: dir, in: .userDomainMask).first else { continue }
+            let hf = base.appendingPathComponent("huggingface", isDirectory: true)
+            guard fm.fileExists(atPath: hf.path) else { NSLog("[OV] hubdump %@: (none)", name); continue }
+            NSLog("[OV] hubdump %@/huggingface = %lld MB", name, dirSizeBytes(hf) / 1_048_576)
+            guard let en = fm.enumerator(at: hf, includingPropertiesForKeys: [.isDirectoryKey]) else { continue }
+            for case let url as URL in en where en.level <= 4 {
+                let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+                if isDir {
+                    NSLog("[OV] hubdump  L%d dir  %@ = %lld MB", en.level,
+                          url.path.replacingOccurrences(of: hf.path, with: ""), dirSizeBytes(url) / 1_048_576)
+                    if en.level == 4 { en.skipDescendants() }
+                }
+            }
+        }
+        // tmp leftovers
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        if let items = try? fm.contentsOfDirectory(at: tmp, includingPropertiesForKeys: nil) {
+            for i in items where i.lastPathComponent.hasPrefix("CFNetworkDownload_") {
+                NSLog("[OV] hubdump tmp %@ = %lld MB", i.lastPathComponent, dirSizeBytes(i) / 1_048_576)
+            }
+        }
+    }
+
+    /// On-disk size in bytes. With a `modelId`, measures ONLY that model's snapshot (plus its
+    /// in-flight download temp files); previously this summed the whole cache, so every model
+    /// showed the same total. Empty id = everything (legacy/all-models).
+    nonisolated static func downloadedSizeBytes(for modelId: String = "") -> Int64 {
+        guard !modelId.isEmpty else {
+            return modelDataURLs().reduce(0) { $0 + dirSizeBytes($1) }
+        }
+        return repoDirectories(for: modelId).reduce(0) { $0 + dirSizeBytes($1) }
+    }
+
+    /// Bytes on disk attributable to an in-progress download of `modelId`: the partial snapshot
+    /// plus CFNetwork's in-flight temp files (where the big safetensors grows until it completes).
+    /// Only temps CREATED after `start` count — stale orphans from interrupted downloads made the
+    /// progress bar jump straight to 99%.
+    nonisolated private static func inFlightDownloadBytes(for modelId: String, since start: Date) -> Int64 {
+        var total = downloadedSizeBytes(for: modelId)
+        let fm = FileManager.default
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        if let items = try? fm.contentsOfDirectory(at: tmp, includingPropertiesForKeys: [.creationDateKey]) {
+            for item in items where item.lastPathComponent.hasPrefix("CFNetworkDownload_") {
+                let created = (try? item.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantPast
+                if created >= start { total += dirSizeBytes(item) }
+            }
+        }
+        return total
+    }
+
+    /// Delete ONE model's snapshot from disk (previously this wiped every model). Unloads it from
+    /// memory first if it's the loaded one. Falls back to the full legacy cleanup if no per-model
+    /// directory can be found for the id.
     func deleteDownloadedModel(_ modelId: String) async -> Bool {
-        // Drop the in-memory model so we're not holding files we're about to remove.
-        modelContainer = nil
-        loadedModelId = nil
-        isModelLoaded = false
-        Memory.clearCache()
-        setState(.disconnected)
+        // Drop the in-memory model if it's the one being removed.
+        if loadedModelId == modelId || loadedModelId == nil {
+            modelContainer = nil
+            loadedModelId = nil
+            isModelLoaded = false
+            Memory.clearCache()
+            setState(.disconnected)
+        }
 
         return await Task.detached {
             let fm = FileManager.default
+            let repoDirs = Self.repoDirectories(for: modelId)
+            // No per-model dir found (legacy LiteRT layout / unknown cache shape) → full cleanup.
+            let targets = repoDirs.isEmpty ? Self.modelDataURLs() : repoDirs
+            if repoDirs.isEmpty { NSLog("[OV] deleteModel: no repo dir for %@ — falling back to full cleanup", modelId) }
             var removedAny = false
-            for url in Self.modelDataURLs() where fm.fileExists(atPath: url.path) {
+            for url in targets where fm.fileExists(atPath: url.path) {
                 let mb = Self.dirSizeBytes(url) / 1_048_576
                 do {
                     try fm.removeItem(at: url)
