@@ -65,6 +65,14 @@ final class ConversationManager: ObservableObject {
         return currentConversation!
     }
 
+    /// True while the current conversation is still within its inactivity window — i.e. a new
+    /// message would append to it rather than start a new conversation. Model context (memory)
+    /// follows this same boundary.
+    var isCurrentConversationFresh: Bool {
+        guard let current = currentConversation else { return false }
+        return Date().timeIntervalSince(current.lastActivityAt) < inactivityTimeout
+    }
+
     /// Add a message to the current conversation
     func addMessage(_ message: Message) {
         var conversation = getOrCreateCurrentConversation()
@@ -119,12 +127,16 @@ final class ConversationManager: ObservableObject {
 
     /// Resume a conversation
     func resumeConversation(_ conversation: Conversation) {
-        currentConversation = conversation
+        var resumed = conversation
+        // Touch the activity clock — otherwise the inactivity check immediately spins up a NEW
+        // conversation on the next message, silently defeating the resume.
+        resumed.lastActivityAt = Date()
+        currentConversation = resumed
 
         // Move to top of list
         if let index = conversations.firstIndex(where: { $0.id == conversation.id }) {
             conversations.remove(at: index)
-            conversations.insert(conversation, at: 0)
+            conversations.insert(resumed, at: 0)
         }
 
         print("[ConversationManager] Resumed conversation: \(conversation.id)")
