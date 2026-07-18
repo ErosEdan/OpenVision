@@ -88,6 +88,11 @@ enum LocalAgent {
         guard let output = await generate(system, history, command) else {
             return .answer("Sorry, I couldn't process that — please try again.")
         }
+        return await resolve(output, command: command)
+    }
+
+    /// Turn the model's raw output into a RouteResult (parse face/search/tool JSON, else answer).
+    private static func resolve(_ output: String, command: String) async -> RouteResult {
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         NSLog("[OV] route(\"%@\") -> %@", command, String(trimmed.prefix(120)))
         if let start = trimmed.firstIndex(of: "{"), let end = trimmed.lastIndex(of: "}"), start < end,
@@ -111,6 +116,9 @@ enum LocalAgent {
                NativeToolRegistry.shared.isNativeTool(toolName) {
                 var toolArgs = obj
                 toolArgs.removeValue(forKey: "tool")
+                // The registry sanity-checks time args against the utterance (relative-time guard)
+                // — record it so "15 minutes from now" can override the model's clock math.
+                NativeToolContext.shared.set(command)
                 let toolResult = await NativeToolRegistry.shared.execute(name: toolName, args: toolArgs)
                 return .answer(toolResult)
             }
@@ -138,10 +146,20 @@ enum LocalAgent {
 @MainActor
 protocol LocalTextLLM: AnyObject {
     func routeCommand(_ command: String) async -> LocalAgent.RouteResult
+    /// Like `routeCommand`, but emits the cumulative output via `onPartial` while generating, so
+    /// the caller can pipeline speech behind generation. Backends that can't stream fall back to
+    /// the plain route (default implementation) — `onPartial` simply never fires.
+    func routeCommandStreaming(_ command: String, onPartial: @escaping (String) -> Void) async -> LocalAgent.RouteResult
     func answerWithSearchResult(question: String, result: String) async -> String
     /// Given a search query that returned nothing, propose ONE better query (or nil to give up).
     /// Enables an agentic retry so a weak first query doesn't sink the whole search.
     func reformulateSearchQuery(question: String, triedQuery: String) async -> String?
+}
+
+extension LocalTextLLM {
+    func routeCommandStreaming(_ command: String, onPartial: @escaping (String) -> Void) async -> LocalAgent.RouteResult {
+        await routeCommand(command)
+    }
 }
 
 extension LocalAgent {
