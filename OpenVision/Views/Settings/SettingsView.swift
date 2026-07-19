@@ -110,6 +110,12 @@ struct SettingsView: View {
 
                 // Advanced Section
                 Section {
+                    NavigationLink {
+                        DocumentsSettingsView()
+                    } label: {
+                        Label("My Documents", systemImage: "books.vertical")
+                    }
+
                     Toggle(isOn: $settingsManager.settings.autoReconnect) {
                         Label("Auto-Reconnect", systemImage: "arrow.triangle.2.circlepath")
                     }

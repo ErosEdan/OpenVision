@@ -135,6 +135,8 @@ final class AppleFoundationService: ObservableObject, LocalTextLLM {
     - other: anything else — a question, chat, a request for current info, or any "who is <named or famous person>" (e.g. "who is Elon Musk", "who is the president")
 
     When unsure, choose "other". Only pick a face action when the user clearly means a person physically present.
+
+    Questions about documents, letters, manuals, recipes, or their contents are NEVER face actions — always "other". This includes "who is the document addressing", "the person's name in the document/letter", and "summarize the letter": the person is named IN TEXT, not standing in front of the user.
     """
 
     private static func assistantInstructions() -> String {
@@ -148,11 +150,11 @@ final class AppleFoundationService: ObservableObject, LocalTextLLM {
     - the user asks about current or real-time information (news, weather, prices, sports scores, recent events), OR
     - you are not fully confident in your answer, you don't know, or your knowledge might be outdated or incomplete.
 
-    NEVER tell the user you don't know, that you can't help, or that your knowledge ends at a past date. Always run web_search first and answer from the results. Prefer searching over guessing. Only answer directly, without searching, when you are genuinely confident the information is stable and well-known (e.g. math, definitions, general facts).
+    NEVER tell the user you don't know, that you can't help, or that your knowledge ends at a past date. Always run web_search first and answer from the results. Prefer searching over guessing. Only answer directly, without searching, when you are genuinely confident the information is stable and well-known (e.g. math, definitions, general facts). EXCEPTION: questions about the user's own documents (their letter, manual, recipe) are answered from search_docs or the provided excerpts — never from web_search; the web knows nothing about their personal documents.
 
     CRITICAL: web_search returns its results immediately, inside this same reply. You must read those results and give the final answer now. NEVER say you will search "later", "shortly", "in a moment", or provide the answer "once it's available" — there is no later; this is your only turn. If the search returns nothing useful, simply say you couldn't find that right now — do not promise to follow up.
 
-    You can also handle productivity hands-free by calling the matching tool: set_timer, start_pomodoro, create_reminder, calendar (read/add events), note (save/search/list notes auto-tagged with place and time), and copy_to_clipboard. After a tool runs, briefly confirm what you did in one sentence.
+    You can also handle productivity hands-free by calling the matching tool: set_timer, start_pomodoro, create_reminder, calendar (read/add events), note (save/search/list notes auto-tagged with place and time), copy_to_clipboard, and search_docs (search the user's imported manuals/recipes/guides — use it whenever they ask about their documents, and answer only from what it returns). After a tool runs, briefly confirm what you did in one sentence.
     """
     }
 
@@ -183,11 +185,23 @@ final class AppleFoundationService: ObservableObject, LocalTextLLM {
                     session = LanguageModelSession(tools: tools, instructions: Self.assistantInstructions())
                     answerSessionBox = session
                 }
-                let response = try await session.respond(to: command)
+                // Document-focus mode: while the user works with a document, its relevant
+                // excerpts ride along on every request.
+                var prompt = command
+                if let docContext = DocumentFocus.shared.contextForQuery(command) {
+                    prompt = docContext + "\n\nUser request: " + command
+                }
+                let response = try await session.respond(to: prompt)
                 return .answer(response.content)
             } catch {
                 NSLog("[OV] Apple route failed: %@", "\(error)")
-                let answer = await generate(system: Self.assistantInstructions(), user: command)
+                // Fallback must keep document grounding: without it, a context overflow on a
+                // document question produced a confident "I don't have access to any document."
+                var user = command
+                if let docContext = DocumentFocus.shared.contextForQuery(command) {
+                    user = docContext + "\n\nUser request: " + command
+                }
+                let answer = await generate(system: Self.assistantInstructions(), user: user)
                 return .answer(answer ?? "Sorry, I couldn't answer that right now.")
             }
         }
