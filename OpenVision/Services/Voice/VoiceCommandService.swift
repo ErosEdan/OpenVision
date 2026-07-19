@@ -88,6 +88,14 @@ final class VoiceCommandService: ObservableObject {
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
 
+    /// Identity of the CURRENT recognition task. A canceled SFSpeechRecognitionTask still delivers
+    /// dying callbacks (stale partials, an empty final, a "canceled" error). Without this guard
+    /// those zombie callbacks are indistinguishable from the live recognizer ending — each
+    /// restart's own corpse then scheduled the next restart, tearing the recognizer down every
+    /// second and chopping user speech into unrecognizable fragments (commands never transcribed).
+    /// Every (re)start bumps the generation; callbacks from older generations are dropped.
+    private var recognitionGeneration = 0
+
     // MARK: - Audio Engine
 
     private var audioEngine: AVAudioEngine?
@@ -203,10 +211,13 @@ final class VoiceCommandService: ObservableObject {
         }
 
         // Start recognition task after audio engine is running
+        recognitionGeneration += 1
+        let generation = recognitionGeneration
         recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             Task { @MainActor in
-                self?.handleRecognitionResult(result: result, error: error)
-                self?.restartIfRecognizerEnded(result: result, error: error)
+                guard let self, generation == self.recognitionGeneration else { return }  // zombie task
+                self.handleRecognitionResult(result: result, error: error)
+                self.restartIfRecognizerEnded(result: result, error: error)
             }
         }
 
@@ -232,8 +243,15 @@ final class VoiceCommandService: ObservableObject {
     /// so restart a fresh recognizer whenever the task ends and we're still meant to be listening.
     private func restartIfRecognizerEnded(result: SFSpeechRecognitionResult?, error: Error?) {
         let ended = (error != nil) || (result?.isFinal ?? false)
-        guard ended, isListening, isWakeWordEnabled, state == .idle else { return }
-        if let error { print("[VoiceCommand] Recognizer ended (\(error.localizedDescription)) — will relaunch wake-word listener") }
+        // Idle (wake-word) AND conversation mode both rely on an always-running recognizer with no
+        // other flow to revive it. Restricting this to `.idle` caused a deaf-mic race: an empty
+        // final result arriving while still in conversationMode skipped the restart here, then the
+        // conversation timeout returned to idle with a dead recognizer — and every "Ok Vision"
+        // after that hit silence. (`.listening`/`.processing` are excluded on purpose: their
+        // restarts are owned by handleCommandComplete / the TTS flow.)
+        let needsAlwaysOnRecognizer = (state == .idle && isWakeWordEnabled) || state == .conversationMode
+        guard ended, isListening, needsAlwaysOnRecognizer else { return }
+        if let error { print("[VoiceCommand] Recognizer ended (\(error.localizedDescription)) — will relaunch listener") }
         scheduleWakeWordRestart()
     }
 
@@ -247,7 +265,12 @@ final class VoiceCommandService: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.wakeWordRestartScheduled = false
-            guard self.isListening, self.state == .idle, self.isWakeWordEnabled else { return }
+            // Same states as restartIfRecognizerEnded: idle wake-word listening or conversation
+            // mode. The state may legitimately have flipped between scheduling and firing (e.g.
+            // conversationMode → timeout → idle); both still need a live recognizer.
+            let stillNeedsRecognizer = (self.state == .idle && self.isWakeWordEnabled)
+                || self.state == .conversationMode
+            guard self.isListening, stillNeedsRecognizer else { return }
             self.lastRecognizerRestart = Date()
             self.restartRecognition()
         }
@@ -255,6 +278,7 @@ final class VoiceCommandService: ObservableObject {
 
     /// Stop listening
     func stopListening() {
+        recognitionGeneration += 1   // orphan any in-flight callbacks from the dying task
         recognitionTask?.cancel()
         recognitionTask = nil
 
@@ -298,7 +322,9 @@ final class VoiceCommandService: ObservableObject {
     private func restartRecognition() {
         guard isListening else { return }
 
-        // Stop current recognition
+        // Stop current recognition. Bump the generation FIRST so the canceled task's dying
+        // callbacks (delivered async) are orphaned immediately, not just once the new task exists.
+        recognitionGeneration += 1
         recognitionTask?.cancel()
         recognitionTask = nil
         recognitionRequest?.endAudio()
@@ -353,10 +379,13 @@ final class VoiceCommandService: ObservableObject {
         }
 
         // Start new recognition task
+        recognitionGeneration += 1
+        let generation = recognitionGeneration
         recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { [weak self] result, error in
             Task { @MainActor in
-                self?.handleRecognitionResult(result: result, error: error)
-                self?.restartIfRecognizerEnded(result: result, error: error)
+                guard let self, generation == self.recognitionGeneration else { return }  // zombie task
+                self.handleRecognitionResult(result: result, error: error)
+                self.restartIfRecognizerEnded(result: result, error: error)
             }
         }
 
@@ -371,6 +400,10 @@ final class VoiceCommandService: ObservableObject {
         conversationTimeoutTimer?.invalidate()
         conversationTimeoutTimer = nil
         hasSpokenThisTurn = false
+        // Don't trust the recognizer to still be alive here: if it emitted its final result while
+        // we were still in conversationMode, no restart fired and idle would sit deaf to the wake
+        // word. Relaunch unconditionally — this also clears any stale transcript buffer.
+        restartRecognition()
         print("[VoiceCommand] Exited conversation mode")
     }
 

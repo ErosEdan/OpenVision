@@ -11,6 +11,7 @@
 		0CD9B9D7D0854411C0A04148 /* AIBackendProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = A900F00D2451513A29BC4C6F /* AIBackendProtocol.swift */; };
 		1339DF5D7DB28F0048D95846 /* WebSearchService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 44D24962AB43639AF3B59662 /* WebSearchService.swift */; };
 		186FD72F369F1962B15EB858 /* OpenClawService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C539AB340611B1A6CCC50F17 /* OpenClawService.swift */; };
+		1D0AEF3C7A810FF410C8F2E5 /* SessionRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 06B8E5499FB1BA51EF6F1741 /* SessionRecorder.swift */; };
 		1EEA4B0E379A76881244FAB9 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3DE51DA812A9394A5064F60E /* SettingsView.swift */; };
 		223474C328BCC3C81ADCB93D /* OpenAIService.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFDF4A693D2CEB248757FBD3 /* OpenAIService.swift */; };
 		2947D6E5D6D5B7080C53D478 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C27052ECD2FFC79652B5CDB3 /* OnboardingView.swift */; };
@@ -102,6 +103,7 @@
 
 /* Begin PBXFileReference section */
 		01CC70E5327BD07B920833FC /* GlassCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlassCard.swift; sourceTree = "<group>"; };
+		06B8E5499FB1BA51EF6F1741 /* SessionRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionRecorder.swift; sourceTree = "<group>"; };
 		09CF2D46A856380011EEC513 /* OVExceptionCatcher.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = OVExceptionCatcher.m; sourceTree = "<group>"; };
 		0E256E8AF9CAB4123C91B979 /* TranscriptBubble.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranscriptBubble.swift; sourceTree = "<group>"; };
 		1ABBF4AC21A442A2C3CF6750 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
@@ -329,6 +331,14 @@
 			path = Web;
 			sourceTree = "<group>";
 		};
+		6CBFDF50FCD7E9FD672D9DA7 /* Recording */ = {
+			isa = PBXGroup;
+			children = (
+				06B8E5499FB1BA51EF6F1741 /* SessionRecorder.swift */,
+			);
+			path = Recording;
+			sourceTree = "<group>";
+		};
 		6F88A349C5879912D099B630 /* App */ = {
 			isa = PBXGroup;
 			children = (
@@ -368,6 +378,7 @@
 				C37934DAC6755B4E1A63B13F /* NativeTools */,
 				03755A8F00C2C19369155953 /* OpenAIRealtime */,
 				867CD5E802B9354B21C23D0B /* OpenClaw */,
+				6CBFDF50FCD7E9FD672D9DA7 /* Recording */,
 				C6EBF5734AD805262779ECA5 /* TTS */,
 				FE408AE66B4AA82F2C43B752 /* Vision */,
 				500CF1A1CC87EC3E3E60B086 /* Voice */,
@@ -743,6 +754,7 @@
 				EF5319DFC76B8BD9A50EF195 /* OpenVisionApp.swift in Sources */,
 				5F9D55BB6AA2E4CF8AF85A49 /* PomodoroTool.swift in Sources */,
 				CB6636C853387785316153FD /* ReminderTool.swift in Sources */,
+				1D0AEF3C7A810FF410C8F2E5 /* SessionRecorder.swift in Sources */,
 				F7718545E4E6BB4A7773B564 /* SettingsManager.swift in Sources */,
 				1EEA4B0E379A76881244FAB9 /* SettingsView.swift in Sources */,
 				6C065C29CC13488E67A70363 /* SoundService.swift in Sources */,

@@ -130,6 +130,30 @@ struct VoiceAgentView: View {
 
             Spacer()
 
+            // Transient "Saved to Photos" / failure status after a recording finishes.
+            if let status = viewModel.recordingStatus {
+                Text(status)
+                    .font(.caption.bold())
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(.black.opacity(0.55)))
+                    .transition(.opacity)
+            }
+
+            // POV recording toggle (glasses video + as-heard audio → Photos).
+            if glassesManager.isRegistered {
+                Button {
+                    viewModel.toggleRecording()
+                } label: {
+                    Image(systemName: viewModel.isRecording ? "stop.circle.fill" : "record.circle")
+                        .font(.title2)
+                        .foregroundColor(viewModel.isRecording ? .red : .white)
+                        .padding(.horizontal, 4)
+                }
+                .accessibilityLabel(viewModel.isRecording ? "Stop recording" : "Record point of view")
+            }
+
             // Glasses status
             HStack(spacing: 8) {
                 Image(systemName: "eyeglasses")
