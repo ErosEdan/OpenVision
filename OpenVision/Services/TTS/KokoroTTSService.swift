@@ -101,21 +101,38 @@ final class KokoroTTSService: ObservableObject {
     // MARK: - Speak
 
     /// Synthesize + play `text` in the given voice. Runs generation off the main actor.
+    ///
+    /// Synthesis is per-SENTENCE, not whole-reply: a single `generateAudio` pass allocates MLX
+    /// memory proportional to text length, and a ~400-char reply spiked >1 GB — enough to jetsam
+    /// the app when SmolVLM2 is resident (~6 GB ceiling; confirmed twice from the device's memory
+    /// telemetry). Per-sentence generation bounds each spike, and the first sentence starts
+    /// playing while the rest still synthesize, so long replies also START sooner.
     func speak(_ text: String, voice: String) async {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, isModelReady else { return }
         isSpeaking = true   // set immediately so the UI pauses the recognizer during synthesis too
+        generationActive = true
+        defer {
+            generationActive = false
+            if pendingBuffers <= 0 { isSpeaking = false }   // everything already played (or nothing to play)
+        }
         do {
             let voiceArray = try await ensureVoice(voice)
             let tts = try ensureEngine()
             let language: Language = voice.first == "b" ? .enGB : .enUS
-            // Generate on a background task — MLX compute shouldn't block the main actor.
-            let samples: [Float] = try await Task.detached(priority: .userInitiated) {
-                let (audio, _) = try tts.generateAudio(voice: voiceArray, language: language, text: clean)
-                return audio
-            }.value
-            if samples.isEmpty { isSpeaking = false; return }
-            play(samples)   // clears isSpeaking when playback finishes
+            var first = true
+            for sentence in TextChunking.sentences(clean) {
+                guard isSpeaking else { break }   // stop() was called mid-reply
+                let samples: [Float] = try await Task.detached(priority: .userInitiated) {
+                    let (audio, _) = try tts.generateAudio(voice: voiceArray, language: language, text: sentence)
+                    return audio
+                }.value
+                guard isSpeaking else { break }
+                if !samples.isEmpty {
+                    enqueue(samples, restartPlayer: first)
+                    first = false
+                }
+            }
         } catch {
             NSLog("[OV] Kokoro speak failed: %@", "\(error)")
             isSpeaking = false
@@ -123,13 +140,23 @@ final class KokoroTTSService: ObservableObject {
     }
 
     func stop() {
+        isSpeaking = false          // breaks the per-sentence synthesis loop
+        pendingBuffers = 0
         if audioReady { playerNode.stop() }
-        isSpeaking = false
     }
 
-    // MARK: - Playback (24 kHz mono float)
+    // MARK: - Playback (24 kHz mono float, sentence-queued)
 
-    private func play(_ samples: [Float]) {
+    /// Buffers scheduled on the player that haven't finished playing yet. Combined with
+    /// `generationActive` this decides when the whole reply is done: `isSpeaking` only clears
+    /// once generation has finished AND the last queued sentence has played out.
+    private var pendingBuffers = 0
+    private var generationActive = false
+
+    /// Queue one sentence's audio. `restartPlayer` is true for a reply's first sentence — it
+    /// clears anything left from a previous (interrupted) reply; later sentences append to the
+    /// player's queue so playback is gapless while synthesis runs ahead.
+    private func enqueue(_ samples: [Float], restartPlayer: Bool) {
         guard !samples.isEmpty,
               let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false),
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)) else { return }
@@ -141,13 +168,30 @@ final class KokoroTTSService: ObservableObject {
             if !audioReady {
                 audioEngine.attach(playerNode)
                 audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: format)
+                // Forward what we play to the session recorder (cheap no-op when not recording):
+                // the assistant's voice is mixed into demo recordings digitally, since the mic
+                // path buries it under ambient noise.
+                let tapFormat = audioEngine.mainMixerNode.outputFormat(forBus: 0)
+                audioEngine.mainMixerNode.installTap(onBus: 0, bufferSize: 1024, format: tapFormat) { buffer, when in
+                    SessionRecorder.shared.appendPlaybackAudio(buffer, at: when)
+                }
                 audioReady = true
             }
             if !audioEngine.isRunning { try audioEngine.start() }
-            playerNode.stop()
+            if restartPlayer {
+                playerNode.stop()
+                pendingBuffers = 0
+            }
+            pendingBuffers += 1
             // .dataPlayedBack fires when the audio has actually finished playing (not just scheduled).
             playerNode.scheduleBuffer(buffer, at: nil, options: [], completionCallbackType: .dataPlayedBack) { [weak self] _ in
-                Task { @MainActor in self?.isSpeaking = false }
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.pendingBuffers -= 1
+                    if self.pendingBuffers <= 0 && !self.generationActive {
+                        self.isSpeaking = false
+                    }
+                }
             }
             playerNode.play()
         } catch {

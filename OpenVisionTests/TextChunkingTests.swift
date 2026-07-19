@@ -38,4 +38,38 @@ final class TextChunkingTests: XCTestCase {
     func testQuestionAndExclamation() {
         XCTAssertEqual(boundaryOffset("Really? Yes! And then"), 12)   // just past "Yes!"
     }
+
+    // MARK: - sentences() (per-sentence Kokoro synthesis — bounds MLX memory spikes)
+
+    func testSentencesSplitsOnTerminators() {
+        XCTAssertEqual(TextChunking.sentences("First. Second! Third?"),
+                       ["First.", "Second!", "Third?"])
+    }
+
+    func testSentencesKeepsTrailingFragment() {
+        XCTAssertEqual(TextChunking.sentences("Done. And one more thing"),
+                       ["Done.", "And one more thing"])
+    }
+
+    func testSentencesDoesNotSplitDecimals() {
+        XCTAssertEqual(TextChunking.sentences("It is 2.5 meters tall. Impressive."),
+                       ["It is 2.5 meters tall.", "Impressive."])
+    }
+
+    func testSentencesSplitsOnNewlines() {
+        XCTAssertEqual(TextChunking.sentences("line one\nline two"),
+                       ["line one", "line two"])
+    }
+
+    func testSentencesDropsEmptiesAndTrims() {
+        XCTAssertEqual(TextChunking.sentences("  Hello.   \n\n  World.  "),
+                       ["Hello.", "World."])
+        XCTAssertEqual(TextChunking.sentences(""), [])
+        XCTAssertEqual(TextChunking.sentences("   \n  "), [])
+    }
+
+    func testSentencesSingleFragment() {
+        XCTAssertEqual(TextChunking.sentences("no terminator here"),
+                       ["no terminator here"])
+    }
 }

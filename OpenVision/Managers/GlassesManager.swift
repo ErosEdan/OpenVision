@@ -3,6 +3,7 @@
 
 import Foundation
 import SwiftUI
+import CoreMedia
 import MWDATCore
 import MWDATCamera
 
@@ -57,6 +58,10 @@ final class GlassesManager: ObservableObject {
 
     /// Called when a video frame is received
     var onVideoFrame: ((UIImage) -> Void)?
+
+    /// Called with the raw sample buffer for every video frame — used by SessionRecorder to mux
+    /// the glasses POV into a movie file without going through UIImage. Independent of `onVideoFrame`.
+    var onVideoSampleBuffer: ((CMSampleBuffer) -> Void)?
 
     /// Called when a photo is captured
     var onPhotoCaptured: ((Data) -> Void)?
@@ -271,6 +276,9 @@ final class GlassesManager: ObservableObject {
         // Video frame listener
         videoFrameListenerToken = session.videoFramePublisher.listen { [weak self] frame in
             Task { @MainActor in
+                // Hand the raw sample buffer to the recorder (if any). SessionRecorder immediately
+                // hops it onto its own writer queue, so this stays cheap even at 30fps.
+                self?.onVideoSampleBuffer?(frame.sampleBuffer)
                 if let image = frame.makeUIImage() {
                     self?.lastFrame = image
                     self?.lastFrameTime = Date()

@@ -25,6 +25,7 @@ final class VoiceAgentViewModel: ObservableObject {
     let soundService = SoundService.shared
     let audioCapture = AudioCaptureService()
     let audioPlayback = AudioPlaybackService()
+    let sessionRecorder = SessionRecorder.shared
 
     // MARK: - Published UI state
 
@@ -38,6 +39,10 @@ final class VoiceAgentViewModel: ObservableObject {
     @Published var isLiveVideoMode = false
     /// True when voice recognition is ready (audio engine running)
     @Published var isVoiceReady = false
+    /// True while a POV demo recording (glasses video + mic audio) is in progress.
+    @Published var isRecording = false
+    /// Transient status shown after a recording finishes ("Saved to Photos" / a failure). Auto-clears.
+    @Published var recordingStatus: String?
 
     // MARK: - Internal state
 
@@ -331,7 +336,12 @@ final class VoiceAgentViewModel: ObservableObject {
     /// pre-checking availability (which can't see HFP until it's allowed). Returns true on glasses.
     @discardableResult
     private func applyPreferredAudioRoute() -> Bool {
+        // Never pick the glasses HFP mic while the camera is streaming: video saturates the
+        // Bluetooth link, so the SCO audio channel can't be serviced. configureForGlasses() can
+        // still "succeed" in that state, but the mic is deaf — commands are never transcribed
+        // (seen when recording starts the stream before a wake-word session). Phone mic instead.
         if settingsManager.settings.preferGlassesMic, glassesManager.isRegistered,
+           !glassesManager.isStreaming,
            (try? AudioSessionManager.shared.configureForGlasses()) == true {
             return true
         }
@@ -349,6 +359,7 @@ final class VoiceAgentViewModel: ObservableObject {
         // wake after the first (the route stays on HFP between sessions, so the re-config is pure
         // churn). Skipping it keeps SCO stable, so the wake chime plays cleanly each time.
         if settingsManager.settings.preferGlassesMic, glassesManager.isRegistered,
+           !glassesManager.isStreaming,   // HFP is deaf while the camera streams — reconfigure to phone
            AudioSessionManager.shared.isBluetoothHFPActive, voiceCommandService.isListening {
             return
         }
@@ -1177,6 +1188,64 @@ final class VoiceAgentViewModel: ObservableObject {
         return "Look closely at the image and answer specifically and concretely: \(s)"
     }
 
+    // MARK: - POV Recording
+
+    /// Toggle a demo recording of the glasses point-of-view (video) plus the phone mic (audio,
+    /// which captures the scene sound and the assistant's spoken reply played out the speaker).
+    /// The result is saved to Photos for sharing.
+    func toggleRecording() {
+        if isRecording {
+            sessionRecorder.stop()   // finishes async; `onFinished` resets state + reports the save
+        } else {
+            Task { await startRecording() }
+        }
+    }
+
+    private func startRecording() async {
+        guard glassesManager.isRegistered else {
+            errorMessage = "Connect your glasses first to record."
+            return
+        }
+        // Recording needs a live frame stream; start it if the user isn't already in live video.
+        if !glassesManager.isStreaming {
+            await glassesManager.startStreaming()
+        }
+        guard glassesManager.isStreaming else {
+            errorMessage = "Couldn't start the glasses camera to record."
+            return
+        }
+
+        // Route the raw glasses frames into the recorder. This is separate from `onVideoFrame`
+        // (which feeds the AI in live mode), so recording and live vision can run together.
+        glassesManager.onVideoSampleBuffer = { [weak self] sampleBuffer in
+            self?.sessionRecorder.appendVideoSampleBuffer(sampleBuffer)
+        }
+
+        sessionRecorder.onFinished = { [weak self] url in
+            guard let self else { return }
+            self.isRecording = false
+            self.glassesManager.onVideoSampleBuffer = nil
+            self.showRecordingStatus(url != nil ? "Saved to Photos" : "Couldn't save recording")
+        }
+
+        do {
+            try sessionRecorder.start()
+            isRecording = true
+        } catch {
+            glassesManager.onVideoSampleBuffer = nil
+            errorMessage = "Recording failed to start: \(error.localizedDescription)"
+        }
+    }
+
+    /// Show a brief status message after a recording finishes, then clear it.
+    private func showRecordingStatus(_ text: String) {
+        recordingStatus = text
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            if self?.recordingStatus == text { self?.recordingStatus = nil }
+        }
+    }
+
     // MARK: - Face recognition
 
     /// Route face-recognition commands using the on-device model as an intent classifier
@@ -1662,5 +1731,33 @@ enum TextChunking {
             i = next
         }
         return boundary
+    }
+
+    /// Split `s` into speakable sentence chunks using the same boundary rules as
+    /// `lastSentenceBoundary` (terminator followed by a break, or newline). Chunks are trimmed;
+    /// empties dropped; text after the last terminator is included as a final chunk.
+    /// Used by Kokoro TTS to synthesize per-sentence — one long reply in a single MLX pass
+    /// spikes memory proportional to its length (jetsam risk next to SmolVLM2).
+    static func sentences(_ s: String) -> [String] {
+        let terminators: Set<Character> = [".", "!", "?"]
+        var result: [String] = []
+        var current = ""
+        var i = s.startIndex
+        while i < s.endIndex {
+            let c = s[i]
+            current.append(c)
+            let next = s.index(after: i)
+            let isBoundary = c == "\n"
+                || (terminators.contains(c) && (next == s.endIndex || s[next] == " " || s[next] == "\n"))
+            if isBoundary {
+                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { result.append(trimmed) }
+                current = ""
+            }
+            i = next
+        }
+        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { result.append(tail) }
+        return result
     }
 }
