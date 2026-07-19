@@ -47,6 +47,14 @@ final class AudioPlaybackService: ObservableObject {
 
         engine.connect(player, to: engine.mainMixerNode, format: outputFormat)
 
+        // Forward what we play to the session recorder (cheap no-op when not recording): the
+        // assistant's voice is mixed into demo recordings digitally, since the mic path buries
+        // it under ambient noise.
+        let tapFormat = engine.mainMixerNode.outputFormat(forBus: 0)
+        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 1024, format: tapFormat) { buffer, when in
+            SessionRecorder.shared.appendPlaybackAudio(buffer, at: when)
+        }
+
         try engine.start()
         print("[AudioPlayback] Engine started")
     }

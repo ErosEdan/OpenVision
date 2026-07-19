@@ -1732,4 +1732,32 @@ enum TextChunking {
         }
         return boundary
     }
+
+    /// Split `s` into speakable sentence chunks using the same boundary rules as
+    /// `lastSentenceBoundary` (terminator followed by a break, or newline). Chunks are trimmed;
+    /// empties dropped; text after the last terminator is included as a final chunk.
+    /// Used by Kokoro TTS to synthesize per-sentence — one long reply in a single MLX pass
+    /// spikes memory proportional to its length (jetsam risk next to SmolVLM2).
+    static func sentences(_ s: String) -> [String] {
+        let terminators: Set<Character> = [".", "!", "?"]
+        var result: [String] = []
+        var current = ""
+        var i = s.startIndex
+        while i < s.endIndex {
+            let c = s[i]
+            current.append(c)
+            let next = s.index(after: i)
+            let isBoundary = c == "\n"
+                || (terminators.contains(c) && (next == s.endIndex || s[next] == " " || s[next] == "\n"))
+            if isBoundary {
+                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { result.append(trimmed) }
+                current = ""
+            }
+            i = next
+        }
+        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tail.isEmpty { result.append(tail) }
+        return result
+    }
 }

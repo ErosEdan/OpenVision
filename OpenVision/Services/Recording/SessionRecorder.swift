@@ -53,12 +53,34 @@ final class SessionRecorder: ObservableObject {
     private var pixelAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var audioInput: AVAssetWriterInput?
 
+    // MARK: - Playback (AI voice) track state — touched only on `writerQueue`
+    //
+    // The assistant's spoken reply is captured DIGITALLY (taps on the playback engines' mixer
+    // nodes forward their buffers here) into a second audio track, because the acoustic path
+    // (speaker → room → mic) buries it under ambient noise. At stop, the tracks are merged with
+    // the mic ducked while the assistant speaks.
+
+    private var playbackInput: AVAssetWriterInput?
+    /// End PTS of the last playback sample written. Playback audio is sparse (only while the
+    /// assistant speaks) but an audio track's samples are laid out contiguously — gaps must be
+    /// filled with silence or everything after a gap plays early and drifts out of sync.
+    private var playbackCursor: CMTime = .zero
+    /// Time ranges (writer timeline) where the assistant was speaking — drives mic ducking.
+    private var speechIntervals: [CMTimeRange] = []
+    private var didCapturePlayback = false
+    /// Keeps the playback track continuously silence-filled to within ~1 s of "now". Without it
+    /// the first audible buffer of a reply had to backfill the entire recording-so-far in one
+    /// burst; the realtime input throttled mid-burst and the reply's first ~second was dropped —
+    /// heard as the roomy mic version of the assistant's voice before the clean track "kicks in".
+    private var silencePump: DispatchSourceTimer?
+
     private let hostClock = CMClockGetHostTimeClock()
     /// Host time of the first video frame; the writer session starts at .zero, everything else is
     /// stamped relative to this. `nil` until the first video frame creates the writer.
     private var sessionStart: CMTime?
     private var outputURL: URL?
     private var finished = false
+    private var videoFrameCount = 0
 
     // MARK: - Audio capture (own engine)
 
@@ -67,6 +89,13 @@ final class SessionRecorder: ObservableObject {
     private var audioEngine = AVAudioEngine()
     private var audioConverter: AVAudioConverter?
     private var configObserver: NSObjectProtocol?
+
+    /// Converter for playback (AI voice) buffers. Sources differ (Kokoro: 24 kHz mono; realtime
+    /// backends: device-rate stereo) and may interleave, so it's rebuilt when the format changes.
+    /// Guarded by `playbackConvertLock` — tap callbacks arrive on each engine's render thread.
+    private var playbackConverter: AVAudioConverter?
+    private var playbackSourceFormat: AVAudioFormat?
+    private let playbackConvertLock = NSLock()
     /// Canonical output format we feed to the writer: mono Int16, 44.1kHz — trivial to package as
     /// a CMSampleBuffer and fine for AAC transcode.
     private let audioOutFormat = AVAudioFormat(commonFormat: .pcmFormatInt16,
@@ -94,9 +123,20 @@ final class SessionRecorder: ObservableObject {
             self.videoInput = nil
             self.pixelAdaptor = nil
             self.audioInput = nil
+            self.playbackInput = nil
+            self.playbackCursor = .zero
+            self.speechIntervals = []
+            self.didCapturePlayback = false
+            self.silencePump?.cancel()
+            self.silencePump = nil
             self.sessionStart = nil
             self.finished = false
+            self.videoFrameCount = 0
         }
+        playbackConvertLock.lock()
+        playbackConverter = nil
+        playbackSourceFormat = nil
+        playbackConvertLock.unlock()
 
         try startMic()
 
@@ -126,16 +166,102 @@ final class SessionRecorder: ObservableObject {
                 return
             }
             self.finished = true
+            self.silencePump?.cancel()
+            self.silencePump = nil
             self.videoInput?.markAsFinished()
             self.audioInput?.markAsFinished()
+            self.playbackInput?.markAsFinished()
+            // Snapshot on the writer queue — the finishWriting completion runs elsewhere.
+            let intervals = self.didCapturePlayback ? self.speechIntervals : []
             writer.finishWriting {
                 if writer.status == .completed, let url = self.outputURL {
-                    self.saveToPhotos(url)
+                    if intervals.isEmpty {
+                        // No assistant speech captured — nothing to merge, ship the raw file.
+                        self.saveToPhotos(url)
+                    } else {
+                        Task { await self.mergeAndSave(rawURL: url, speechIntervals: intervals) }
+                    }
                 } else {
                     NSLog("[Recorder] finishWriting failed: %@", String(describing: writer.error))
                     self.finish(url: nil)
                 }
             }
+        }
+    }
+
+    // MARK: - Merge (mic + AI voice → one track, mic ducked while the assistant speaks)
+
+    /// Combine the raw file's three tracks (video, mic, assistant voice) into a single shareable
+    /// .mp4. The export mixes both audio tracks into one; an AVAudioMix ducks the mic to 25%
+    /// while the assistant speaks so its digitally-captured voice reads clearly over ambient
+    /// noise (and over its own faint acoustic echo picked up by the mic). Falls back to the raw
+    /// file on any failure — that still has the mic track, matching pre-merge behavior.
+    private func mergeAndSave(rawURL: URL, speechIntervals: [CMTimeRange]) async {
+        let asset = AVURLAsset(url: rawURL)
+        do {
+            let videoTracks = try await asset.loadTracks(withMediaType: .video)
+            let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+            let duration = try await asset.load(.duration)
+            // Writer add-order: [0] mic, [1] assistant voice.
+            guard let videoTrack = videoTracks.first, audioTracks.count >= 2 else {
+                NSLog("[Recorder] Merge skipped — unexpected track layout")
+                saveToPhotos(rawURL)
+                return
+            }
+            let micTrack = audioTracks[0]
+            let voiceTrack = audioTracks[1]
+
+            let composition = AVMutableComposition()
+            let fullRange = CMTimeRange(start: .zero, duration: duration)
+            guard let compVideo = composition.addMutableTrack(withMediaType: .video,
+                                                              preferredTrackID: kCMPersistentTrackID_Invalid),
+                  let compMic = composition.addMutableTrack(withMediaType: .audio,
+                                                            preferredTrackID: kCMPersistentTrackID_Invalid),
+                  let compVoice = composition.addMutableTrack(withMediaType: .audio,
+                                                              preferredTrackID: kCMPersistentTrackID_Invalid) else {
+                saveToPhotos(rawURL)
+                return
+            }
+            try compVideo.insertTimeRange(fullRange, of: videoTrack, at: .zero)
+            try compMic.insertTimeRange(CMTimeRange(start: .zero,
+                                                    duration: try await micTrack.load(.timeRange).duration),
+                                        of: micTrack, at: .zero)
+            try compVoice.insertTimeRange(CMTimeRange(start: .zero,
+                                                      duration: try await voiceTrack.load(.timeRange).duration),
+                                          of: voiceTrack, at: .zero)
+            compVideo.preferredTransform = try await videoTrack.load(.preferredTransform)
+
+            // Duck the mic during assistant speech: quick 0.15 s ramps in and out.
+            let micParams = AVMutableAudioMixInputParameters(track: compMic)
+            let ramp = CMTime(seconds: 0.15, preferredTimescale: 600)
+            for interval in speechIntervals {
+                let rampInStart = CMTimeMaximum(.zero, CMTimeSubtract(interval.start, ramp))
+                micParams.setVolumeRamp(fromStartVolume: 1.0, toEndVolume: 0.25,
+                                        timeRange: CMTimeRange(start: rampInStart, end: interval.start))
+                micParams.setVolumeRamp(fromStartVolume: 0.25, toEndVolume: 1.0,
+                                        timeRange: CMTimeRange(start: interval.end,
+                                                               end: CMTimeAdd(interval.end, ramp)))
+            }
+            let voiceParams = AVMutableAudioMixInputParameters(track: compVoice)
+            voiceParams.setVolume(1.0, at: .zero)
+            let audioMix = AVMutableAudioMix()
+            audioMix.inputParameters = [micParams, voiceParams]
+
+            guard let export = AVAssetExportSession(asset: composition,
+                                                    presetName: AVAssetExportPresetHighestQuality) else {
+                saveToPhotos(rawURL)
+                return
+            }
+            export.audioMix = audioMix
+            let mergedURL = rawURL.deletingPathExtension().appendingPathExtension("merged.mp4")
+            try? FileManager.default.removeItem(at: mergedURL)
+            try await export.export(to: mergedURL, as: .mp4)
+            NSLog("[Recorder] Merged %d speech interval(s) — mic ducked", speechIntervals.count)
+            try? FileManager.default.removeItem(at: rawURL)
+            saveToPhotos(mergedURL)
+        } catch {
+            NSLog("[Recorder] Merge failed (%@) — saving raw recording", error.localizedDescription)
+            saveToPhotos(rawURL)
         }
     }
 
@@ -159,6 +285,14 @@ final class SessionRecorder: ObservableObject {
               let start = sessionStart, input.isReadyForMoreMediaData else { return }
         let pts = CMTimeSubtract(now, start)
         adaptor.append(pixelBuffer, withPresentationTime: pts)
+
+        // Memory telemetry (~every 5 s at 30 fps): recording + live vision runs near the jetsam
+        // ceiling, and a SIGKILL leaves no crash log — this trail in the console is the evidence.
+        videoFrameCount += 1
+        if videoFrameCount % 150 == 0 {
+            let availableMB = os_proc_available_memory() / (1024 * 1024)
+            NSLog("[Recorder] jetsam headroom: %d MB", availableMB)
+        }
     }
 
     private func createWriter(firstPixelBuffer: CVPixelBuffer, firstFrameTime: CMTime) {
@@ -175,7 +309,14 @@ final class SessionRecorder: ObservableObject {
         let videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
             AVVideoWidthKey: width,
-            AVVideoHeightKey: height
+            AVVideoHeightKey: height,
+            // Explicit bitrate: the default is stingy for a moving handheld/head-mounted POV.
+            // ~4 Mbps at 504×896 keeps encode artifacts out of the quality budget (the BT stream
+            // itself is the ceiling).
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: 4_000_000,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+            ]
         ]
         let vInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         vInput.expectsMediaDataInRealTime = true
@@ -197,6 +338,13 @@ final class SessionRecorder: ObservableObject {
         aInput.expectsMediaDataInRealTime = true
         if writer.canAdd(aInput) { writer.add(aInput) }
 
+        // Second audio track: the assistant's voice, captured digitally from the playback engines.
+        // Added unconditionally (an empty track is harmless and skipped at merge time). Track
+        // order matters: mic is added first, playback second — the merge step relies on it.
+        let pInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+        pInput.expectsMediaDataInRealTime = true
+        if writer.canAdd(pInput) { writer.add(pInput) }
+
         guard writer.startWriting() else {
             NSLog("[Recorder] startWriting failed: %@", String(describing: writer.error))
             return
@@ -207,8 +355,150 @@ final class SessionRecorder: ObservableObject {
         self.videoInput = vInput
         self.pixelAdaptor = adaptor
         self.audioInput = aInput
+        self.playbackInput = pInput
         self.sessionStart = firstFrameTime
+        startSilencePump()
         NSLog("[Recorder] Writer ready (%dx%d)", width, height)
+    }
+
+    // MARK: - Playback audio (AI voice, captured digitally)
+
+    /// Forward a buffer the app is PLAYING (the assistant's voice) into the recording. Called from
+    /// playback engines' mixer taps on their render threads; cheap no-op when not recording.
+    /// `when` is the tap's timestamp — used for precise alignment when valid.
+    func appendPlaybackAudio(_ buffer: AVAudioPCMBuffer, at when: AVAudioTime?) {
+        guard isRecording, buffer.frameLength > 0 else { return }
+
+        // Mixer taps run continuously while their engine runs, emitting silence between replies.
+        // Only audible content counts — otherwise "assistant speaking" would span the whole
+        // session and the mic would stay ducked. (~-54 dBFS threshold; gaps the gate creates are
+        // silence-filled on append, and >0.5 s gaps split the ducking intervals — both desired.)
+        guard peakLevel(of: buffer) > 0.002 else { return }
+
+        // Prefer the render timestamp (mach host time, same timebase as our host clock).
+        let time: CMTime
+        if let when, when.isHostTimeValid {
+            time = CMClockMakeHostTimeFromSystemUnits(when.hostTime)
+        } else {
+            time = CMClockGetTime(hostClock)
+        }
+
+        playbackConvertLock.lock()
+        if playbackSourceFormat != buffer.format {
+            playbackConverter = AVAudioConverter(from: buffer.format, to: audioOutFormat)
+            playbackSourceFormat = buffer.format
+        }
+        guard let converter = playbackConverter else { playbackConvertLock.unlock(); return }
+
+        let ratio = audioOutFormat.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
+        guard let outBuffer = AVAudioPCMBuffer(pcmFormat: audioOutFormat, frameCapacity: capacity) else {
+            playbackConvertLock.unlock(); return
+        }
+        var supplied = false
+        var convError: NSError?
+        converter.convert(to: outBuffer, error: &convError) { _, statusPtr in
+            if supplied { statusPtr.pointee = .noDataNow; return nil }
+            supplied = true
+            statusPtr.pointee = .haveData
+            return buffer
+        }
+        playbackConvertLock.unlock()
+        guard convError == nil, outBuffer.frameLength > 0 else { return }
+
+        writerQueue.async {
+            self.appendPlayback(outBuffer, at: time)
+        }
+    }
+
+    /// Fill the playback track with silence from the cursor up to `pts`, in ≤1 s chunks.
+    /// Audio samples are laid out contiguously in the track regardless of PTS gaps, so a sparse
+    /// track (assistant speaks at 0:30 and 1:10) would compact and drift without this.
+    /// Appending while !isReadyForMoreMediaData is an uncaught NSException → crash (hit in
+    /// testing), so readiness is re-checked before EVERY append. Returns true when the gap is
+    /// fully closed (≤60 ms remaining). Must run on `writerQueue`.
+    @discardableResult
+    private func fillSilence(upTo pts: CMTime, input: AVAssetWriterInput) -> Bool {
+        var gap = CMTimeSubtract(pts, playbackCursor)
+        while gap.seconds > 0.06 {
+            guard input.isReadyForMoreMediaData else { return false }
+            let chunkSeconds = min(gap.seconds, 1.0)
+            let frames = AVAudioFrameCount(chunkSeconds * audioOutFormat.sampleRate)
+            guard let silence = AVAudioPCMBuffer(pcmFormat: audioOutFormat, frameCapacity: frames) else { return false }
+            silence.frameLength = frames   // buffer memory is zero-initialized → silence
+            guard let sample = makeAudioSampleBuffer(silence, pts: playbackCursor) else { return false }
+            input.append(sample)
+            playbackCursor = CMTimeAdd(playbackCursor,
+                                       CMTime(value: CMTimeValue(frames), timescale: 44_100))
+            gap = CMTimeSubtract(pts, playbackCursor)
+        }
+        return true
+    }
+
+    /// Start the timer that keeps the playback track silence-filled to within ~1 s of "now".
+    /// Runs on `writerQueue`; the 1 s lag stays safely behind in-flight audible buffers (tap
+    /// latency is tens of ms) so real audio is never pre-empted by silence.
+    private func startSilencePump() {
+        let timer = DispatchSource.makeTimerSource(queue: writerQueue)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.setEventHandler { [weak self] in
+            guard let self, let input = self.playbackInput, let start = self.sessionStart,
+                  !self.finished else { return }
+            let elapsed = CMTimeSubtract(CMClockGetTime(self.hostClock), start)
+            let target = CMTimeSubtract(elapsed, CMTime(seconds: 1.0, preferredTimescale: 600))
+            if target > self.playbackCursor {
+                self.fillSilence(upTo: target, input: input)
+            }
+        }
+        timer.resume()
+        silencePump = timer
+    }
+
+    /// Peak absolute sample value across channels (0 for unsupported formats — treated as silence).
+    private func peakLevel(of buffer: AVAudioPCMBuffer) -> Float {
+        guard let channels = buffer.floatChannelData else { return 0 }
+        let frames = Int(buffer.frameLength)
+        var peak: Float = 0
+        for ch in 0..<Int(buffer.format.channelCount) {
+            let data = channels[ch]
+            for i in 0..<frames {
+                let v = abs(data[i])
+                if v > peak { peak = v }
+            }
+        }
+        return peak
+    }
+
+    private func appendPlayback(_ buffer: AVAudioPCMBuffer, at time: CMTime) {
+        guard let input = playbackInput, let start = sessionStart, !finished else { return }
+
+        var pts = CMTimeSubtract(time, start)
+        if pts < .zero { pts = .zero }
+        // Never write backwards: overlapping/jittered arrivals snap to the cursor.
+        if pts < playbackCursor { pts = playbackCursor }
+
+        // Close any remaining gap since the last sample. The silence pump keeps this small
+        // (~≤1.5 s), so a reply's onset appends immediately instead of stalling behind a large
+        // backfill. If the writer momentarily throttles anyway, drop this buffer WITHOUT
+        // advancing the cursor — the next callback re-fills, keeping the timeline aligned.
+        guard fillSilence(upTo: pts, input: input),
+              input.isReadyForMoreMediaData,
+              let sample = makeAudioSampleBuffer(buffer, pts: playbackCursor) else { return }
+        input.append(sample)
+        let duration = CMTime(value: CMTimeValue(buffer.frameLength), timescale: 44_100)
+        let end = CMTimeAdd(playbackCursor, duration)
+
+        // Track when the assistant is speaking (merge adjacent buffers into one interval when the
+        // gap is < 0.5 s) — this drives mic ducking at merge time.
+        if var last = speechIntervals.last,
+           CMTimeSubtract(playbackCursor, last.end).seconds < 0.5 {
+            last.duration = CMTimeSubtract(end, last.start)
+            speechIntervals[speechIntervals.count - 1] = last
+        } else {
+            speechIntervals.append(CMTimeRange(start: playbackCursor, end: end))
+        }
+        playbackCursor = end
+        didCapturePlayback = true
     }
 
     // MARK: - Audio
