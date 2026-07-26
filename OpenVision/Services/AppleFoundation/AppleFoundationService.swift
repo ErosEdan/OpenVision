@@ -158,6 +158,21 @@ final class AppleFoundationService: ObservableObject, LocalTextLLM {
     """
     }
 
+    #if canImport(FoundationModels)
+    /// The persistent web-search-equipped answer session (kept across turns for conversation
+    /// memory), created on demand. Callers discard `answerSessionBox` and call again to retry
+    /// with a fresh session after a generation failure.
+    @available(iOS 26.0, *)
+    private func answerSession() -> LanguageModelSession {
+        if let existing = answerSessionBox as? LanguageModelSession { return existing }
+        var tools: [any Tool] = [AppleWebSearchTool()]
+        tools.append(contentsOf: AppleNativeTools.all)
+        let session = LanguageModelSession(tools: tools, instructions: Self.assistantInstructions())
+        answerSessionBox = session
+        return session
+    }
+    #endif
+
     func routeCommand(_ command: String) async -> LocalAgent.RouteResult {
         #if canImport(FoundationModels)
         if #available(iOS 26.0, *), isAvailable, UIApplication.shared.applicationState != .background {
@@ -176,27 +191,32 @@ final class AppleFoundationService: ObservableObject, LocalTextLLM {
                 // Record the utterance so the tool registry's relative-time guard can override
                 // model-computed clock times ("15 minutes from now" is parsed from these words).
                 NativeToolContext.shared.set(command)
-                let session: LanguageModelSession
-                if let existing = answerSessionBox as? LanguageModelSession {
-                    session = existing
-                } else {
-                    var tools: [any Tool] = [AppleWebSearchTool()]
-                    tools.append(contentsOf: AppleNativeTools.all)
-                    session = LanguageModelSession(tools: tools, instructions: Self.assistantInstructions())
-                    answerSessionBox = session
-                }
                 // Document-focus mode: while the user works with a document, its relevant
                 // excerpts ride along on every request.
                 var prompt = command
                 if let docContext = DocumentFocus.shared.contextForQuery(command) {
                     prompt = docContext + "\n\nUser request: " + command
                 }
-                let response = try await session.respond(to: prompt)
-                return .answer(response.content)
+                do {
+                    let response = try await answerSession().respond(to: prompt)
+                    return .answer(response.content)
+                } catch {
+                    // The cached session fails transiently (com.apple.tokengeneration Code=10)
+                    // and permanently once its accumulated transcript nears the 4096-token
+                    // window. Either way the cure is the same: discard it and retry ONCE with a
+                    // fresh session — losing conversation memory but keeping tools, so a
+                    // web-search answer still comes from live results instead of the old
+                    // fallback's from-memory reply.
+                    NSLog("[OV] Apple answer session failed (%@) — retrying with a fresh session", "\(error)")
+                    answerSessionBox = nil
+                    let response = try await answerSession().respond(to: prompt)
+                    return .answer(response.content)
+                }
             } catch {
                 NSLog("[OV] Apple route failed: %@", "\(error)")
-                // Fallback must keep document grounding: without it, a context overflow on a
-                // document question produced a confident "I don't have access to any document."
+                // Last-resort fallback (no tools). Must keep document grounding: without it, a
+                // context overflow on a document question produced a confident "I don't have
+                // access to any document."
                 var user = command
                 if let docContext = DocumentFocus.shared.contextForQuery(command) {
                     user = docContext + "\n\nUser request: " + command
