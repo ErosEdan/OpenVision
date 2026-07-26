@@ -425,6 +425,17 @@ final class GemmaLocalService: ObservableObject {
         setState(.connecting)
         isProcessing = false
 
+        // Switching models: free the CURRENT container before loading the next one. Holding both
+        // (e.g. Gemma 4 E2B + SmolVLM2) exceeds the ~6 GB jetsam ceiling — the app was SIGKILLed
+        // mid-"loading container…" on device. Trade-off: if the new load fails we're left with no
+        // model (a clean failed state the user can retry) instead of a dead app.
+        if modelContainer != nil {
+            print("[GemmaLocal] releasing previous model (\(loadedModelId ?? "?")) before load")
+            modelContainer = nil
+            loadedModelId = nil
+            isModelLoaded = false
+        }
+
         Memory.cacheLimit = 20 * 1024 * 1024
 
         // Cap SmolVLM's image-splitting resolution BEFORE the load reads the processor config
@@ -731,7 +742,16 @@ final class GemmaLocalService: ObservableObject {
             brevity += " You are looking through the glasses camera right now. Describe ONLY what is clearly and currently visible in this exact image. If it's blurry, dark, partly out of frame, or you're not certain what something is, say so briefly instead of guessing — never mention objects you aren't confident are actually present."
         }
         let userSys = SettingsManager.shared.settings.userPrompt
-        let systemContent = userSys.isEmpty ? brevity : "\(userSys)\n\n\(brevity)"
+        var systemContent = userSys.isEmpty ? brevity : "\(userSys)\n\n\(brevity)"
+
+        // Document-focus mode: while the user works with a document, its excerpts ride along —
+        // including on VISION turns, so "does this match my letter?" can ground against the
+        // document while looking at the frame. (Quality caveat: SmolVLM2 is small; heavy text
+        // context alongside an image is a known strain — kept because the grounded use case
+        // outweighs it, and the excerpts are bounded.)
+        if let docContext = await DocumentFocus.shared.contextForQuery(text) {
+            systemContent += "\n\n" + docContext
+        }
 
         var chat: [Chat.Message] = []
         chat.append(.init(role: .system, content: systemContent))

@@ -15,7 +15,7 @@ enum AppleNativeTools {
     /// All native tools, ready to hand to a LanguageModelSession.
     static var all: [any Tool] {
         [AppleTimerTool(), ApplePomodoroTool(), AppleReminderTool(),
-         AppleCalendarTool(), AppleNoteTool(), AppleClipboardTool()]
+         AppleCalendarTool(), AppleNoteTool(), AppleClipboardTool(), AppleDocsTool()]
     }
 
     /// Run a native tool by name with a cleaned-up arg dict (drops empty strings / zeros meaning "unset").
@@ -135,6 +135,21 @@ struct AppleClipboardTool: Tool {
     }
     func call(arguments: Arguments) async throws -> String {
         await AppleNativeTools.run(name, ["text": arguments.text])
+    }
+}
+
+@available(iOS 26.0, *)
+struct AppleDocsTool: Tool {
+    let name = "search_docs"
+    let description = "Work with the user's imported documents (manuals, recipes, guides). search: find relevant passages (use when asked about their documents). list: name the documents. focus: user wants to work with one document ('open my router manual') — it will then be checked first for every question. unfocus: user is done ('close the document')."
+    @Generable struct Arguments {
+        @Guide(description: "search, list, focus, or unfocus") let action: String
+        @Guide(description: "What to look for (search), or the document name (focus). Empty otherwise.") let query: String
+    }
+    func call(arguments: Arguments) async throws -> String {
+        var args: [String: Any] = ["action": arguments.action]
+        if !arguments.query.isEmpty { args["query"] = arguments.query }
+        return await AppleNativeTools.run(name, args)
     }
 }
 #endif

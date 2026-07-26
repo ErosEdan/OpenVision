@@ -23,6 +23,7 @@ struct VoiceAgentView: View {
     @StateObject private var voiceCommandService = VoiceCommandService.shared
     @StateObject private var ttsService = TTSService.shared
     @StateObject private var kokoroTTS = KokoroTTSService.shared
+    @StateObject private var documentFocus = DocumentFocus.shared
 
     // MARK: - Body
 
@@ -40,6 +41,22 @@ struct VoiceAgentView: View {
             VStack(spacing: 0) {
                 topBar
                     .padding(.top, 8)
+                // Document-focus pill: visible whenever a document is "open" so the mode is never
+                // silently steering answers. Tap to release focus.
+                if let doc = documentFocus.activeDocument {
+                    HStack(spacing: 6) {
+                        Image(systemName: "book.fill").font(.caption2)
+                        Text(doc.title).font(.caption.bold()).lineLimit(1)
+                        Image(systemName: "xmark.circle.fill").font(.caption2).opacity(0.7)
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(Color.indigo.opacity(0.8)))
+                    .padding(.top, 8)
+                    .onTapGesture { documentFocus.deactivate() }
+                    .transition(.opacity)
+                }
                 Spacer()
                 centerContent
                 Spacer()

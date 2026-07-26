@@ -60,6 +60,11 @@ final class OpenAIService: ObservableObject {
         if !system.isEmpty {
             messages.append(["role": "system", "content": system])
         }
+        // Document-focus mode: while the user is working with a document, its most relevant
+        // excerpts ride along on EVERY request — deterministic grounding, no tool-call judgment.
+        if let docContext = DocumentFocus.shared.contextForQuery(text) {
+            messages.append(["role": "system", "content": docContext])
+        }
         // Prior turns so follow-up questions work ("what's its population?").
         for turn in ConversationContext.shared.turns {
             messages.append(["role": turn.role, "content": turn.content])
@@ -150,7 +155,7 @@ final class OpenAIService: ObservableObject {
         // Keep replies short — they're spoken aloud. Append the user's custom instructions.
         let today = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime])
         var parts = ["You are OpenVision, a helpful voice assistant for smart glasses. Answer conversationally and briefly (1-3 short sentences) since your reply is spoken aloud. If the user asks about current or real-time information, or anything you're not certain of, call the web_search tool and answer from its results — never say you can't access real-time data.",
-                     "You can also handle productivity hands-free by calling the matching tool: set_timer, start_pomodoro, create_reminder, calendar (read/add events), note (save/search notes auto-tagged with place and time), and copy_to_clipboard. For a specific time of day (e.g. '6pm', '9:30am') pass the tool's hour (24-hour) and minute, plus day_offset (0=today, 1=tomorrow) — let the tool do the date math. Use minutes_from_now only for 'in N minutes'. The current time is \(today).",
+                     "You can also handle productivity hands-free by calling the matching tool: set_timer, start_pomodoro, create_reminder, calendar (read/add events), note (save/search notes auto-tagged with place and time), copy_to_clipboard, and search_docs (search the user's imported manuals/recipes/guides — use it whenever they ask about their documents, and answer only from what it returns). For a specific time of day (e.g. '6pm', '9:30am') pass the tool's hour (24-hour) and minute, plus day_offset (0=today, 1=tomorrow) — let the tool do the date math. Use minutes_from_now only for 'in N minutes'. The current time is \(today).",
                      "After a tool runs, briefly confirm what you did in one sentence."]
         let custom = settings.userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !custom.isEmpty { parts.append(custom) }

@@ -57,6 +57,7 @@ final class NativeToolRegistry {
             CalendarTool(),
             ContextualNoteTool(),
             ClipboardTool(),
+            DocumentSearchTool(),
         ]
         var map: [String: NativeTool] = [:]
         for t in all { map[t.name] = t }

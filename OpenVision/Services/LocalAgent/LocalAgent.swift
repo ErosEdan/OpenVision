@@ -27,7 +27,10 @@ enum LocalAgent {
     /// `history` gives the model recent turns so follow-up questions work.
     static func route(_ command: String, history: [ConversationContext.Turn], generate: Generate) async -> RouteResult {
         let now = ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withInternetDateTime])
-        let system = """
+        // Document-focus mode: while the user works with a document, its relevant excerpts ride
+        // along on every request (appended to the system prompt below).
+        let docContext = await DocumentFocus.shared.contextForQuery(command)
+        var system = """
         You are a voice assistant for smart glasses that can recognize faces the user has taught you.
 
         Face actions apply ONLY to a real person PHYSICALLY IN FRONT of the user right now (seen through the glasses camera). If the user names a person, or asks about a public/famous/historical figure, or asks a general "who is…" question, that is NOT a face action — answer it or search instead.
@@ -54,6 +57,15 @@ enum LocalAgent {
         User: who won the match → (search)
         User: who wrote Hamlet → (answer normally)
 
+        Questions about documents, letters, manuals, recipes, or their contents are NEVER face actions — the person is named IN TEXT, not standing in front of the user. Answer from the document excerpts (if provided below) or use the search_docs tool:
+        User: is Mansi authorized in this letter → (answer from the document)
+        User: who exactly is authorized in my document → (answer from the document)
+        User: whose name is in the letter → (answer from the document)
+        User: summarize the authorization letter → (answer from the document)
+        User: is Mansi Kumari authorized to collect my belongings → (answer from the document)
+
+        NEVER choose "identify" when the user's request already NAMES a person — identify exists only for an UNKNOWN person physically present ("who is this"). A named person means the question is about a document, general knowledge, or a search — never a face action.
+
         Use a web search if EITHER is true: the user asks about current/real-time information (news, weather, sports scores, prices, recent events), OR you don't know the answer, aren't fully confident, or your knowledge may be outdated. In that case reply with ONLY: {"tool":"web_search","query":"A_CONCISE_SEARCH_QUERY"}. Never tell the user you don't know without searching first.
         User: what's the weather in Tokyo → {"tool":"web_search","query":"weather in Tokyo"}
         User: who won the game last night → {"tool":"web_search","query":"latest game result"}
@@ -70,6 +82,9 @@ enum LocalAgent {
         - Note save: {"tool":"note","action":"save","content":"parked in lot B"}
         - Note search: {"tool":"note","action":"search","query":"parking"}
         - Copy text: {"tool":"copy_to_clipboard","text":"the text to copy"}
+        - Document search (the user's imported manuals/recipes/guides): {"tool":"search_docs","action":"search","query":"router error 5"}
+        - Open/focus a document to work with it: {"tool":"search_docs","action":"focus","query":"router manual"}
+        - Close the open document: {"tool":"search_docs","action":"unfocus"}
         TIME RULES (the tool does the date math — never compute a date or minute count yourself):
         - A specific time of day like "6pm", "9:30am", "at 6" → give "hour" in 24-hour form (6pm=18, 9am=9) and "minute" if any; add "day_offset":1 for tomorrow.
         - Only "in N minutes/hours from now" → give "minutes_from_now". The current time is \(now).
@@ -80,15 +95,40 @@ enum LocalAgent {
         User: add a meeting tomorrow at 9:30am → {"tool":"calendar","action":"add","title":"meeting","hour":9,"minute":30,"day_offset":1}
         User: what's on my calendar today → {"tool":"calendar","action":"today"}
         User: note that I parked in lot B → {"tool":"note","action":"save","content":"parked in lot B"}
+        User: what does my manual say about error 5 → {"tool":"search_docs","action":"search","query":"error 5"}
+        User: how long does the recipe say to bake it → {"tool":"search_docs","action":"search","query":"baking time"}
+        User: open my router manual → {"tool":"search_docs","action":"focus","query":"router manual"}
+        User: let's work with the lasagna recipe → {"tool":"search_docs","action":"focus","query":"lasagna recipe"}
+        User: close the document → {"tool":"search_docs","action":"unfocus"}
 
         Only answer directly (no search or action) when you are genuinely confident it's stable, well-known info — math, definitions, general facts. Then answer in 1-3 short sentences. Do NOT mention faces, tools, or JSON.
 
         You DO have conversation memory: the earlier messages in this chat are your record of the conversation so far. Use them for follow-ups — e.g. for "what were we talking about?" summarize those earlier messages; for "what about X?" resolve it against the previous topic. Never claim you can't remember when earlier messages exist.
         """
+        if let docContext { system += "\n\n" + docContext }
         guard let output = await generate(system, history, command) else {
             return .answer("Sorry, I couldn't process that — please try again.")
         }
-        return await resolve(output, command: command)
+        let result = await resolve(output, command: command)
+
+        // Focused-document override (deterministic — prompt rules alone failed 3× on device):
+        // the small local model persistently misroutes "is <name> authorized …" to face-identify.
+        // While a document is FOCUSED, an identify with no physical-presence cue in the command is
+        // a document question — answer it from the excerpts instead of firing the camera.
+        if case .face(let intent) = result, intent.action == "identify", let docContext {
+            let lower = command.lowercased()
+            let presenceCues = ["this person", "in front", "looking at", "this face",
+                                "who is this", "who am i looking"]
+            if !presenceCues.contains(where: { lower.contains($0) }) {
+                NSLog("[OV] route override: identify → document answer (focus active, no presence cue)")
+                let answerSystem = "You are a voice assistant for smart glasses. Answer briefly "
+                    + "(1-3 short sentences) since your reply is spoken aloud.\n\n" + docContext
+                if let answer = await generate(answerSystem, history, command) {
+                    return .answer(answer.trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+            }
+        }
+        return result
     }
 
     /// Turn the model's raw output into a RouteResult (parse face/search/tool JSON, else answer).
