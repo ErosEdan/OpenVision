@@ -57,16 +57,23 @@ enum WebSearchService {
             }
             var parts: [String] = []
             // Tavily's synthesized answer is the cleanest thing to hand the model.
-            if let answer = json["answer"] as? String, !answer.isEmpty { parts.append(answer) }
-            // Plus a few supporting result snippets.
+            if let answer = json["answer"] as? String, !answer.isEmpty {
+                parts.append(String(answer.prefix(800)))
+            }
+            // Plus a few supporting result snippets — each CAPPED. News queries return multi-KB
+            // content fields; an uncapped payload hit 11 KB and overflowed Apple's 4096-token
+            // context, so the turn errored and the fallback answered WITHOUT the search results
+            // (heard as "it answered from memory"). The reply is spoken in 2-3 sentences; a few
+            // hundred chars per result is plenty for every backend.
             if let results = json["results"] as? [[String: Any]] {
                 for r in results.prefix(4) {
                     guard let content = (r["content"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !content.isEmpty else { continue }
                     let title = (r["title"] as? String) ?? ""
-                    parts.append(title.isEmpty ? content : "\(title): \(content)")
+                    let snippet = String(content.prefix(350))
+                    parts.append(title.isEmpty ? snippet : "\(title): \(snippet)")
                 }
             }
-            let combined = parts.joined(separator: "\n")
+            let combined = String(parts.joined(separator: "\n").prefix(2600))
             if !combined.isEmpty {
                 NSLog("[OV] Tavily hit: %d chars (%d results) for \"%@\"", combined.count, (json["results"] as? [[String: Any]])?.count ?? 0, query)
             }
