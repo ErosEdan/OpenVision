@@ -27,7 +27,14 @@ let package = Package(
         .product(name: "MLXUtilsLibrary", package: "MLXUtilsLibrary")
      ],
      resources: [
-      .process("../../Resources/")
+      .process("../../Resources/us_silver.json"),
+      .process("../../Resources/us_gold.json"),
+      .process("../../Resources/us_bart_config.json"),
+      .process("../../Resources/us_bart.safetensors"),
+      .process("../../Resources/gb_silver.json"),
+      .process("../../Resources/gb_gold.json"),
+      .process("../../Resources/gb_bart_config.json"),
+      .process("../../Resources/gb_bart.safetensors")
      ]
     )
   ]
