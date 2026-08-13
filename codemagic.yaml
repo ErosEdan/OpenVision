@@ -1,0 +1,74 @@
+workflows:
+  openvision-iphone:
+    name: OpenVision signed iPhone IPA
+    max_build_duration: 120
+    instance_type: mac_mini_m2
+
+    integrations:
+      app_store_connect: codemagic
+
+    environment:
+      ios_signing:
+        distribution_type: ad_hoc
+        bundle_identifier: ca.seedtosausage.openvision
+      vars:
+        BUNDLE_ID: ca.seedtosausage.openvision
+        META_APP_ID: "0"
+        META_CLIENT_TOKEN: ""
+        META_URL_SCHEME: ca-seedtosausage-openvision
+      xcode: latest
+
+    scripts:
+      - name: Confirm Xcode and Swift versions
+        script: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun swift --version
+
+      - name: Configure OpenVision
+        script: |
+          set -euo pipefail
+          PROFILE_PLIST="$(mktemp)"
+          security cms -D -i "$PROVISIONING_PROFILE_PATH" > "$PROFILE_PLIST"
+          APPLE_TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.team-identifier' "$PROFILE_PLIST")
+
+          {
+            printf 'DEVELOPMENT_TEAM = %s\n' "$APPLE_TEAM_ID"
+            printf 'PRODUCT_BUNDLE_IDENTIFIER = %s\n' "$BUNDLE_ID"
+            printf 'META_APP_ID = %s\n' "$META_APP_ID"
+            printf 'CLIENT_TOKEN = %s\n' "$META_CLIENT_TOKEN"
+            printf 'APP_LINK_URL_SCHEME = %s\n' "$META_URL_SCHEME"
+          } > Config.xcconfig
+
+          cp OpenVision/Config/Config.swift.example OpenVision/Config/Config.swift
+
+      - name: Resolve Swift packages
+        script: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project OpenVision.xcodeproj \
+            -scheme OpenVision
+
+      - name: Apply managed Apple signing
+        script: xcode-project use-profiles
+
+      - name: Build signed IPA
+        script: |
+          set -euo pipefail
+          xcode-project build-ipa \
+            --project "$CM_BUILD_DIR/OpenVision.xcodeproj" \
+            --scheme OpenVision \
+            --archive-flags="-destination 'generic/platform=iOS'"
+
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
+
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: "build-*"
+          include: true
+          source: true
