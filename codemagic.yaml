@@ -14,7 +14,6 @@ workflows:
       vars:
         BUNDLE_ID: ca.seedtosausage.openvision
         META_APP_ID: "0"
-        META_CLIENT_TOKEN: ""
         META_URL_SCHEME: ca-seedtosausage-openvision
       xcode: latest
 
@@ -36,7 +35,7 @@ workflows:
             printf 'DEVELOPMENT_TEAM = %s\n' "$APPLE_TEAM_ID"
             printf 'PRODUCT_BUNDLE_IDENTIFIER = %s\n' "$BUNDLE_ID"
             printf 'META_APP_ID = %s\n' "$META_APP_ID"
-            printf 'CLIENT_TOKEN = %s\n' "$META_CLIENT_TOKEN"
+            printf 'CLIENT_TOKEN = %s\n' "${META_CLIENT_TOKEN:-}"
             printf 'APP_LINK_URL_SCHEME = %s\n' "$META_URL_SCHEME"
           } > Config.xcconfig
 
@@ -71,4 +70,3 @@ workflows:
       tag_patterns:
         - pattern: "build-*"
           include: true
-          source: true
