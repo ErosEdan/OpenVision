@@ -54,7 +54,7 @@ workflows:
           xcode-project build-ipa \
             --project "$CM_BUILD_DIR/OpenVision.xcodeproj" \
             --scheme OpenVision \
-            --archive-flags="-destination 'generic/platform=iOS' -skipPackagePluginValidation"
+            --archive-flags="-destination 'generic/platform=iOS' -skipPackagePluginValidation -skipMacroValidation"
 
     artifacts:
       - build/ios/ipa/*.ipa
