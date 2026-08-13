@@ -12,6 +12,7 @@ workflows:
         distribution_type: ad_hoc
         bundle_identifier: ca.seedtosausage.openvision
       vars:
+        APPLE_TEAM_ID: JJ84AR43S2
         BUNDLE_ID: ca.seedtosausage.openvision
         META_APP_ID: "0"
         META_URL_SCHEME: ca-seedtosausage-openvision
@@ -27,10 +28,6 @@ workflows:
       - name: Configure OpenVision
         script: |
           set -euo pipefail
-          PROFILE_PLIST="$(mktemp)"
-          security cms -D -i "$PROVISIONING_PROFILE_PATH" > "$PROFILE_PLIST"
-          APPLE_TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.team-identifier' "$PROFILE_PLIST")
-
           {
             printf 'DEVELOPMENT_TEAM = %s\n' "$APPLE_TEAM_ID"
             printf 'PRODUCT_BUNDLE_IDENTIFIER = %s\n' "$BUNDLE_ID"
