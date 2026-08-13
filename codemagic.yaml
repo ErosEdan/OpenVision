@@ -25,6 +25,11 @@ workflows:
           xcodebuild -version
           xcrun swift --version
 
+      - name: Install Metal toolchain
+        script: |
+          set -euo pipefail
+          xcodebuild -downloadComponent MetalToolchain
+
       - name: Configure OpenVision
         script: |
           set -euo pipefail
